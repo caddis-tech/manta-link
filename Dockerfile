@@ -17,27 +17,35 @@ ENV PYTHONUNBUFFERED=1
 
 # --- BlueOS extension manifest ------------------------------------------------
 #
-# VERIFY THESE AGAINST THE BlueOS VERSION ON THE BOAT BEFORE RELYING ON THEM.
-# The label schema has changed across BlueOS releases, and Kraken silently
-# refuses an extension whose manifest it cannot parse. If an install fails with
-# no useful message, suspect this block first.
+# Written against https://blueos.cloud/docs/stable/development/extensions/
+#
+# Only `version` and `permissions` are required; the rest populate the listing
+# in the Extensions Manager. `version` must be SemVer. `type` must be one of
+# device-integration, tool, other, example. `tags` are lowercase alphanumeric
+# with dashes, ten at most.
 LABEL version="0.1.0"
+
+# Privileged with a /dev bind is verbatim what the docs prescribe for reaching
+# connected serial devices, and it is what any container needs to open a USB CDC
+# device whose path is not fixed.
+#
+# The script narrows that access itself, by matching USB VID 0x2E8A rather than
+# opening whatever ttyACM it finds first. The ArduPilot autopilot is the same CDC
+# ACM class and must never be written to, and privileged mode is exactly the
+# situation where that mistake would succeed.
 LABEL permissions='{\
   "HostConfig": {\
-    "Binds": ["/dev:/dev"],\
     "Privileged": true,\
+    "Binds": ["/dev:/dev"],\
     "RestartPolicy": {"Name": "unless-stopped"}\
   }\
 }'
-LABEL authors='[{"name": "Caddis Tech"}]'
-LABEL company='{"name": "Caddis Tech", "about": "Aquadrone"}'
+
+LABEL authors='[{"name": "Caddis Tech", "email": "michael.klobutcher@gmail.com"}]'
+LABEL company='{"name": "Caddis Tech", "about": "Aquadrone", "email": "michael.klobutcher@gmail.com"}'
 LABEL type="other"
 LABEL tags='["aquadrone", "time", "serial"]'
+LABEL links='{"github": "https://github.com/caddis-tech/aquadrone-time-responder"}'
 LABEL readme="https://raw.githubusercontent.com/caddis-tech/aquadrone-time-responder/main/README.md"
-
-# Privileged plus /dev is what gets a container to a USB CDC device whose path
-# is not fixed. The script narrows that itself by matching USB VID 0x2E8A rather
-# than opening whatever ttyACM it finds, because the ArduPilot autopilot is the
-# same device class and must never be written to.
 
 ENTRYPOINT ["python3", "/app/time_responder.py"]
