@@ -60,20 +60,49 @@ boat pulls it with no credentials.
 
 ## Install on a boat
 
-BlueOS web UI, Extensions, then install from:
+BlueOS web UI, Extensions, **Installed** tab, the **+** button, then:
 
+| Field | Value |
+|---|---|
+| Extension Identifier | `caddis.aquadrone-time-responder` |
+| Extension Name | `Aquadrone Time Responder` |
+| Docker image | `ghcr.io/caddis-tech/aquadrone-time-responder` |
+| Docker tag | `latest`, or a pinned version such as `0.1.0` |
+| Custom settings | leave empty; the image's own `permissions` label is used |
+
+### Checked against a real boat
+
+Read from a running vehicle over its API on 2026-08-05, rather than assumed:
+
+- **BlueOS `1.4.3`, architecture `arm`.** 32-bit, so `linux/arm/v7` is the image
+  that matters. The publish workflow builds it, and arm64 alongside it.
+- **A non-Docker-Hub registry works.** The `blueos.major_tom` extension is
+  installed and enabled from `public.ecr.aws/blueos/bcloud-agent`. The docs
+  describe the manual-install flow in terms of Docker Hub, which left it unclear
+  whether a full registry path was accepted at all. A working AWS ECR extension
+  on real hardware settles it, so `ghcr.io/...` is fine.
+- **This permissions schema matches what is already running.** The Cellular
+  Modem Manager reaches its serial device with
+  `{"HostConfig":{"Privileged":true,"Binds":["/dev:/dev:rw"], ...}}`, the same
+  shape this image declares.
+- **Identifiers follow `vendor.extension-name`**, as in
+  `bluerobotics.cellular-modem-manager` and `williangalvani.zerotier`. Hence
+  `caddis.aquadrone-time-responder`.
+
+**Kraken on 1.4.3 has no offline install**, so the boat needs a route to ghcr.io
+to install or update. Modem-up is a prerequisite for *installing* this, though
+not for running it once installed.
+
+### If an install fails without a useful message
+
+Suspect the `LABEL` block in the `Dockerfile` first. Kraken refuses an extension
+whose manifest it cannot parse and is not forthcoming about why. Read the labels
+back off the built image to confirm they are still valid JSON, since the
+multi-line continuations are easy to break:
+
+```bash
+docker inspect <image> --format '{{json .Config.Labels}}' | python3 -m json.tool
 ```
-ghcr.io/caddis-tech/aquadrone-time-responder:latest
-```
-
-**BlueOS 1.4.3's Kraken has no offline extension install**, so the boat needs a
-route to ghcr.io to install or update. That makes modem-up a prerequisite for
-*installing* this, though not for running it once installed.
-
-**Verify the manifest labels in the `Dockerfile` against the BlueOS version on
-the boat.** The extension label schema has changed across BlueOS releases, and
-Kraken silently refuses an extension whose manifest it cannot parse. If an
-install fails without a useful message, suspect that block first.
 
 ## Checking it works
 
