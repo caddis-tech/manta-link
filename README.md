@@ -89,9 +89,9 @@ If it never syncs, the Pico says so and keeps logging on uptime:
 WARN: no time from the Pi in 180000 ms; records will carry uptime only
 ```
 
-Records from an unsynced run carry `"epoch_ms":"unsynced"` rather than a zero,
-because zero is a real epoch and nothing would distinguish it from an answer
-that never came.
+Records from an unsynced run carry `"epoch_ms":null` rather than a zero, because
+zero is a real epoch and nothing would distinguish it from an answer that never
+came.
 
 If an install fails without a useful message, suspect the `LABEL` block in the
 `Dockerfile`: Kraken refuses a manifest it cannot parse and does not say why.
@@ -100,8 +100,8 @@ If an install fails without a useful message, suspect the `LABEL` block in the
 
 The firmware and this extension ship together. A boat running the firmware
 without this installed waits out the full 180 second boot window on every
-startup before it begins logging, then records `"epoch_ms":"unsynced"` on every
-line. Everything else, all sensors and the SD write path, is unaffected: that is
+startup before it begins logging, then records `"epoch_ms":null` on every line.
+Everything else, all sensors and the SD write path, is unaffected: that is
 exactly the behaviour the firmware had before the feature existed, plus a delay.
 
 ## Release
