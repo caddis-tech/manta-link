@@ -2,10 +2,14 @@ name: Publish extension image
 
 # Tag a release and the image appears. That is the whole deploy story:
 #
-#   git tag v0.1.0 && git push --tags
+#   git tag v0.2.0 && git push --tags
 #
 # The boat then installs it from ghcr.io through Kraken with no credentials,
 # because the package is public.
+#
+# Two gates run first. Publishing a broken image is expensive to undo: Kraken
+# has no offline install, so a boat needs a working route to ghcr.io to recover,
+# and a bad manifest fails the install without saying why.
 on:
   push:
     tags: ["v*"]
@@ -16,7 +20,42 @@ env:
   IMAGE: ${{ github.repository }}
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -e ".[dev]"
+
+      # mypy is pinned to the Linux platform in pyproject, because fcntl and
+      # termios do not exist on the Windows box this is developed on and the
+      # container is the only platform that matters.
+      - run: ruff check .
+      - run: mypy manta_link
+      - run: pytest
+
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Asserts every JSON LABEL parses, that the permissions block still grants
+      # serial access, and that the version LABEL agrees with the tag being
+      # released. Kraken refuses an unparseable manifest silently, so this is the
+      # only place that failure is cheap to find.
+      - name: Validate the BlueOS manifest against the release tag
+        run: python tools/manifest.py "${{ github.ref_name }}"
+
   publish:
+    needs: [test, manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -25,9 +64,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The boats are Raspberry Pi 4. BlueOS images have historically been
-      # 32-bit (linux/arm/v7), but arm64 exists in the wild, so both are built
-      # rather than betting on which one is on the boat in front of you.
+      # The boats are Raspberry Pi 4. BlueOS 1.4.3 on the boat reports a 32-bit
+      # userland (linux/arm/v7), which is what actually runs, but both deps are
+      # pure Python so the arm64 leg is nearly free and removes a class of
+      # "installs, then exec-format-errors" support call.
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 

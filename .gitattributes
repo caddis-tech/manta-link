@@ -1,0 +1,5 @@
+# This repo is developed on Windows and only ever runs inside a Linux container,
+# so LF is the correct line ending everywhere, working copy included. Without
+# this, a shell script added later would be checked out with CRLF and fail in the
+# image with an error that names the interpreter rather than the line endings.
+* text=auto eol=lf

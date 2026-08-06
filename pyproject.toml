@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "manta-link"
+version = "0.2.0"
+description = "The single Pi-side process that owns the Aquadrone Pico's serial port"
+requires-python = ">=3.11"
+dependencies = ["pyserial==3.5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11"]
+
+[tool.setuptools]
+packages = ["manta_link"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+# Checked as Linux regardless of where it runs. The container is armv7 Linux,
+# and fcntl/termios do not exist on the Windows box this is developed on, so a
+# host-platform check would report errors about the only platform that matters.
+platform = "linux"
+warn_unused_ignores = true
+warn_redundant_casts = true
+# pyserial ships no stubs, and vendoring a partial set would be worse than
+# letting the one import be untyped.
+[[tool.mypy.overrides]]
+module = ["serial.*"]
+ignore_missing_imports = true
