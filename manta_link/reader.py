@@ -5,13 +5,15 @@ obligation is answering TIME?: the Pico asks for its first 180 seconds and then
 never asks again, so a missed answer costs that entire run its absolute
 timestamps with no second chance.
 
-Everything else the reader does is handed off. Later steps add a bounded buffer
-and worker threads for records; the rule that keeps working is that no slow or
-failable work ever runs on this thread.
+Everything else is handed off: a line that is not a request is appended to a
+bounded deque and forgotten. At maxlen, deque.append drops the oldest under the
+GIL without blocking or allocating, so a stalled worker costs old records and
+can never cost a reply. No slow or failable work runs on this thread.
 """
 
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 
 import serial
@@ -62,11 +64,13 @@ class SerialReader:
 
     def __init__(
         self,
-        on_record: Callable[[bytes, float], None] | None = None,
-        on_log_line: Callable[[bytes], None] | None = None,
+        records: "deque[tuple[bytes, float]] | None" = None,
+        logs: "deque[bytes] | None" = None,
+        on_tick: Callable[[], None] | None = None,
     ) -> None:
-        self._on_record = on_record
-        self._on_log_line = on_log_line
+        self._records = records
+        self._logs = logs
+        self._on_tick = on_tick
         self._assembler = LineAssembler()
         self._last_absent_log = 0.0
         self.answered_count = 0
@@ -79,6 +83,7 @@ class SerialReader:
         raise things this loop does not name.
         """
         while True:
+            self._tick()
             port_path = find_pico_port()
             if port_path is None:
                 self._log_absent()
@@ -87,8 +92,12 @@ class SerialReader:
 
             try:
                 self._serve(port_path)
-            except (serial.SerialException, OSError) as exc:
-                # Unplugged, reflashed, or the port was taken. None is fatal.
+            except Exception as exc:
+                # Broad on purpose, not a two-class tuple. termios.error is
+                # built with a NULL base in CPython, so it derives from
+                # Exception rather than OSError, and pyserial leaves tcsetattr
+                # (inside Serial.__init__) and tcdrain unwrapped. Unplugging the
+                # Pico between resolving the port and opening it lands here.
                 log.warning("%s went away (%s); reopening", port_path, exc)
             finally:
                 self.connected = False
@@ -128,6 +137,7 @@ class SerialReader:
             while True:
                 chunk = link.read(READ_SIZE)
                 now = time.monotonic()
+                self._tick()
 
                 if chunk:
                     byte_count += len(chunk)
@@ -138,6 +148,23 @@ class SerialReader:
                     log.info("still listening on %s (%d bytes, %d answered)",
                              port_path, byte_count, self.answered_count)
                     last_alive = now
+
+    def _tick(self) -> None:
+        """Give the main thread its one job besides reading: watching health.
+
+        Health is a worker, so nothing inside the worker set can notice its
+        death. This loop is the only context guaranteed to still be running,
+        and it already wakes every read timeout.
+        """
+        if self._on_tick is None:
+            return
+        try:
+            self._on_tick()
+        except Exception:
+            # A bug in the watchdog must not cost the port its owner. Reporting
+            # it and reading on is strictly better than reopening the port,
+            # which is the one event that can lose an in-flight TIME?.
+            log.exception("health check failed; continuing to read")
 
     def _claim_exclusive(self, link: serial.Serial) -> None:
         if _TIOCEXCL is None:
@@ -156,8 +183,11 @@ class SerialReader:
             return
 
         if kind is Kind.RECORD:
-            if self._on_record is not None:
-                self._on_record(line, received)
+            if self._records is not None:
+                # The monotonic receipt time travels with the bytes: step 3
+                # derives a record's absolute timestamp from an anchor and this
+                # offset, and the moment it was parsed is not that moment.
+                self._records.append((line, received))
             return
 
         if kind is Kind.BANNER:
@@ -170,8 +200,8 @@ class SerialReader:
                                 "recording NOTHING to its card")
             return
 
-        if kind is Kind.LOG and self._on_log_line is not None:
-            self._on_log_line(line)
+        if kind is Kind.LOG and self._logs is not None:
+            self._logs.append(line)
 
     def _answer(self, link: serial.Serial) -> None:
         """Write the reply, or stay silent if the clock is not worth sending."""

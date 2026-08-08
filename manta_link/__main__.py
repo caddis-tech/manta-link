@@ -1,9 +1,9 @@
-"""Entry point.
+"""Entry point. Builds the buffers, starts the workers, and reads.
 
-Runs the reader on the main thread deliberately. Later steps add daemon workers
-for capture, GPS, upload and health; putting the reader on the main thread means
-a worker dying, or failing to start at all, cannot take the port owner with it,
-and it is the thread a signal is delivered to.
+The reader stays on the main thread deliberately. A worker dying, or failing to
+start at all, cannot take the port owner with it, and the main thread is the one
+a signal is delivered to. It is also the only context guaranteed to be running,
+which is why the health worker's own liveness is checked from inside its loop.
 """
 
 import logging
@@ -11,7 +11,8 @@ import signal
 import sys
 from types import FrameType
 
-from . import __version__, logging_setup, supervisor
+from . import __version__, capture, logging_setup, supervisor
+from .health import Counters, Health
 from .reader import SerialReader
 
 log = logging.getLogger("manta_link")
@@ -39,9 +40,20 @@ def main() -> int:
     install_signal_handlers()
     log.info("MANTA Link %s starting", __version__)
 
-    reader = SerialReader()
+    counters = Counters()
+    records = capture.new_record_buffer()
+    logs = capture.new_log_buffer()
+
+    worker = capture.CaptureWorker(records, logs, counters)
+    health = Health(counters)
+    health.register("capture", worker.run_forever)
+    health.start()
+
+    reader = SerialReader(
+        records=records, logs=logs, on_tick=health.check_from_main_thread
+    )
     try:
-        supervisor.run_forever("reader", reader.run_forever)
+        supervisor.run_forever("reader", reader.run_forever, health.note_restart)
     except SystemExit:
         log.info("stopped after answering %d request(s)", reader.answered_count)
         return 0

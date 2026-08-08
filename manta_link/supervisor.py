@@ -1,5 +1,10 @@
 """Keeping a loop alive through anything that is not a shutdown.
 
+Every worker thread runs its loop through here, and health hands in its own
+note_restart as on_restart, so a restart is tallied where the heartbeat can
+report it. A callback rather than the health object itself, because health
+imports this module to start those threads in the first place.
+
 The reader is supervised by this too, despite running on the main thread rather
 than as a worker. It is the component the whole design exists to protect, and it
 is reachable by exceptions its own handlers do not name: termios.error is

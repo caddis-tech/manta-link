@@ -3,9 +3,24 @@
 Real hardware failures on this link are not exotic: a Pico that stops draining,
 a device that vanishes mid-read, and a termios error that is not an OSError.
 Each of those has cost us something, so each is injectable here.
+
+Plus the one timing helper the threaded tests need, so waiting on a worker is a
+bounded poll rather than a sleep long enough to be safe on a bad day.
 """
 
+import time
+
 import serial
+
+
+def wait_until(predicate, timeout_s: float = 2.0, poll_s: float = 0.005) -> bool:
+    """Poll until predicate holds. Returns whether it ever did."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(poll_s)
+    return predicate()
 
 
 class FakeSerial:
@@ -26,6 +41,9 @@ class FakeSerial:
         self._write_raises = write_raises
         self._stall_forever_after = stall_forever_after
         self.written = []
+        # When each write landed, so a test can say how long the reply took
+        # rather than only that it happened.
+        self.written_at = []
         self.reads = 0
         self.closed = False
         self.flush_calls = 0
@@ -73,6 +91,7 @@ class FakeSerial:
         if self._write_raises is not None:
             raise self._write_raises
         self.written.append(payload)
+        self.written_at.append(time.monotonic())
         return len(payload)
 
     def flush(self) -> None:

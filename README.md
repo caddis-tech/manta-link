@@ -60,8 +60,24 @@ firmware rejects both and only says so on one side.
 | `framing.py` | Bytes to lines, lines to kinds. Pure, no I/O |
 | `clock.py` | Whether this Pi's clock is worth sending, and what it reads |
 | `portfinder.py` | Finding the Pico among the boat's USB serial devices |
+| `capture.py` | Draining the reader's buffers and parsing, on its own thread |
+| `health.py` | Counters, the heartbeat, and restarting a worker that died |
+| `logging_setup.py` | The log queue, and the one thread that writes to stdout |
 | `supervisor.py` | Keeping a loop alive through anything that is not a shutdown |
 | `__main__.py` | Signal handling, and running the reader on the main thread |
+
+The reader hands a line off by appending it to a bounded `deque` and goes
+straight back to `read()`. At capacity `deque.append` drops the oldest under the
+GIL, so a stalled worker costs old records and can never cost a reply, which is
+the thing that cannot be had twice. Every thread logs through a bounded queue
+for the same reason: a `StreamHandler` writes and flushes while holding a lock
+that every thread shares, and Docker's log delivery blocks when nothing is
+draining its pipe. Lines are dropped when that queue fills, and the count of
+dropped lines is reported once a minute.
+
+Health is a worker as well, so the main thread checks on it from inside the
+reader loop. Nothing inside the worker set could notice health dying, and its
+death would quietly take the watchdog off every other worker.
 
 ## Install on a boat
 
@@ -72,7 +88,7 @@ BlueOS web UI, Extensions, **Installed** tab, the **+** button, then:
 | Extension Identifier | `caddis.manta-link` |
 | Extension Name | `MANTA Link` |
 | Docker image | `ghcr.io/caddis-tech/manta-link` |
-| Docker tag | a pinned version such as `0.2.0` |
+| Docker tag | a pinned version such as `0.3.0` |
 | Custom settings | leave empty; the image's own `permissions` label is used |
 
 Pin the tag rather than using `latest`, so the Extensions Manager shows which
@@ -103,10 +119,11 @@ docker logs -f $(docker ps -q --filter name=manta-link)
 
 A healthy boot logs `listening on /dev/ttyACM0`, then some number of
 `request received, clock not yet synced; silent` while the Pi gets online, then
-one `answered with 1754422392123`. After that it logs `still listening` every
-ten minutes and nothing else. **That near-silence is correct and is the whole
-point**; the periodic line exists so a wedged port looks different from a quiet
-one.
+one `answered with 1754422392123`. After that it says almost nothing: a
+`heartbeat: ...` line of counters every minute, `still listening` every ten,
+and on a Debug image a count of the records captured. **That near-silence is
+correct and is the whole point**; the periodic lines exist so a wedged port and
+a dead worker look different from a quiet boat.
 
 On the Pico's serial stream:
 
@@ -161,7 +178,7 @@ Tag it. CI runs the tests and validates the manifest against the tag before
 anything is pushed.
 
 ```bash
-git tag v0.2.0
+git tag v0.3.0
 git push --tags
 ```
 

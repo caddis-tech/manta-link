@@ -1,5 +1,7 @@
 """The reader's one obligation, and the ways it used to be dodgeable."""
 
+from collections import deque
+
 import pytest
 import serial
 
@@ -112,13 +114,13 @@ class TestWriteHang:
 
 
 class TestDispatch:
-    def test_records_go_to_the_sink_with_a_receipt_time(
+    def test_records_go_to_the_buffer_with_a_receipt_time(
         self, monkeypatch, trusted_clock
     ):
-        seen = []
+        seen = deque(maxlen=8)
         monkeypatch.setattr(reader_mod.serial, "Serial",
                             FakeSerial.factory(chunks=[READING + b"\n"]))
-        rdr = SerialReader(on_record=lambda raw, at: seen.append((raw, at)))
+        rdr = SerialReader(records=seen)
         with pytest.raises(StopPlayback):
             rdr._serve("/dev/fake")
 
@@ -147,15 +149,14 @@ class TestDispatch:
                 rdr._serve("/dev/fake")
         assert "recording NOTHING" not in caplog.text
 
-    def test_a_release_stream_produces_no_record_callbacks(
-        self, monkeypatch, trusted_clock
-    ):
+    def test_a_release_stream_buffers_no_records(self, monkeypatch, trusted_clock):
         """The current fleet state: banner, requests and log lines only.
 
         A flight image routes records to the card, so the record path must stay
         dormant rather than merely correct.
         """
-        records = []
+        records: deque = deque(maxlen=8)
+        logs: deque = deque(maxlen=8)
         program = (
             BANNER + b"\r\n"
             + b"TIME?\n"
@@ -165,9 +166,11 @@ class TestDispatch:
         )
         monkeypatch.setattr(reader_mod.serial, "Serial",
                             FakeSerial.factory(chunks=[program]))
-        rdr = SerialReader(on_record=records.append)
+        rdr = SerialReader(records=records, logs=logs)
         with pytest.raises(StopPlayback):
             rdr._serve("/dev/fake")
 
-        assert records == []
+        assert list(records) == []
         assert rdr.answered_count == 1
+        # The Pico's own log lines still land somewhere a worker can drain.
+        assert b"SD card initialized" in logs
