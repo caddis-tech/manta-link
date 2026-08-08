@@ -238,6 +238,11 @@ class Spool:
             os.replace(partial, self._directory / name)
             self._fsync_directory()
         except (OSError, TypeError, ValueError) as exc:
+            # Nothing else will ever come back for it: put() burns a fresh
+            # sequence number per attempt, and the cap governs indexed entries
+            # only. A full disk failing every cycle would otherwise turn into a
+            # directory of 34,000 orphans a day, pruned only by the next open().
+            self._unlink(partial.name)
             self._counters.bump("spool_write_failures")
             if self._write_log.should_emit():
                 log.error("could not spool a record to %s (%s); %d more "

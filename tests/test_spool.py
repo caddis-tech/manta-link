@@ -134,6 +134,26 @@ class TestPutAndDrain:
         assert counters.get("spool_write_failures") == 1
         assert store.names() == []
 
+    def test_a_failed_write_takes_its_partial_file_with_it(
+        self, monkeypatch, store, counters
+    ):
+        """A disk that is merely full must not become a directory of orphans.
+
+        Every attempt burns a fresh sequence number and the cap governs indexed
+        entries only, so a failure repeating at the cycle rate leaves a distinct
+        file each time, and only the next startup scan prunes them.
+        """
+        def no_space(_fd):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(os, "fsync", no_space)
+
+        for index in range(5):
+            assert store.put(envelope(index)) is None
+
+        assert list(os.scandir(store.directory)) == []
+        assert counters.get("spool_write_failures") == 5
+
     def test_nothing_partial_is_ever_left_where_the_index_can_see_it(self, store):
         store.put(envelope(1))
         on_disk = sorted(entry.name for entry in os.scandir(store.directory))
