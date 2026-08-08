@@ -8,9 +8,11 @@ opener both steals bytes and silently changes the survivor's read timing. This
 extension therefore owns the port outright and does every Pi-side job that needs
 it, rather than letting a second program compete for the same device.
 
-Today that is one job: answer the Pico's boot-time request, so every telemetry
-record carries an absolute timestamp instead of uptime alone. Telemetry capture,
-GPS enrichment, spooling and upload land on top of the same reader.
+Today that is answering the Pico's boot-time request, so every telemetry record
+carries an absolute timestamp instead of uptime alone, and making the records it
+reads durable: a spool for the upload to drain, and an archive that keeps a copy
+on the boat. GPS enrichment and the upload itself land on top of the same
+reader.
 
 Firmware side: [AquadronePicoFirmware](https://github.com/caddis-tech/AquadronePicoFirmware) issue #86.
 
@@ -61,6 +63,9 @@ firmware rejects both and only says so on one side.
 | `clock.py` | Whether this Pi's clock is worth sending, and what it reads |
 | `portfinder.py` | Finding the Pico among the boat's USB serial devices |
 | `capture.py` | Draining the reader's buffers and parsing, on its own thread |
+| `record.py` | The envelope, the timestamp policy, and the field mapping |
+| `spool.py` | The durable queue the upload drains, and where it lives |
+| `archive.py` | The rotating NDJSON copy that stays on the boat |
 | `health.py` | Counters, the heartbeat, and restarting a worker that died |
 | `logging_setup.py` | The log queue, and the one thread that writes to stdout |
 | `supervisor.py` | Keeping a loop alive through anything that is not a shutdown |
@@ -79,6 +84,59 @@ Health is a worker as well, so the main thread checks on it from inside the
 reader loop. Nothing inside the worker set could notice health dying, and its
 death would quietly take the watchdog off every other worker.
 
+## What happens to a record
+
+A parsed record becomes an envelope, is appended to the archive, and is written
+to the spool. The archive goes first, so a spool write that fails still leaves
+the position on the stick.
+
+**The Pico is the source of truth on timestamps.** It stamps at sampling time
+and we can only stamp at receipt, one to three seconds later, so this fills gaps
+and never overrides. A record with `epoch_ms` keeps it. A record without one is
+stamped from the run's boot anchor, if there is one. A record with neither is
+spooled unstamped and becomes eligible to upload the moment an anchor arrives.
+Nothing unstamped is ever uploaded: the API's `timestamp` falls back to *ingest*
+time, so a backlog draining after an outage would land every reading at the
+moment it drained, and there is no correcting it afterwards because a
+resubmitted `client_ref` returns `duplicate` rather than an update.
+
+The anchor is dropped whenever it stops describing the run in front of us: on
+any serial reconnect, on a boot banner, and on an uptime that does not rise. The
+reconnect is the reliable one, because any Pico reset forces a USB
+re-enumeration, while a banner can be printed into a deasserted DTR and never
+arrive. After a drop it re-derives from the next record rather than waiting for
+a banner or a sync line, since a run whose Pi clock was undisciplined at boot
+emits neither.
+
+**The payload is transformed, not copied.** caddis-api stores whatever it is
+sent but reads named properties over fixed keys, and the Pico's names are not
+those keys: `cond_tds_sal` is one string where the API reads `conductivity`,
+`tds` and `salinity` as separate numbers, `ph` arrives as a string, and the API
+reads `water_temperature` rather than `temperature`. A verbatim copy returns
+`created` and reads back empty, with nothing in the write path to say so. Keys
+the API cannot read still travel in the blob, and one the Pico has never sent
+before is counted and named in the log rather than passed through in silence.
+
+`client_ref` is `uuid5` of the raw Pico line, so every copy of one reading
+resolves to the same row: the live upload, a retry after a lost acknowledgement,
+the archive stick and the Pico's own card.
+
+The spool lives in a subdirectory of the extension volume, never the volume
+itself, because `.env` holds the API token and the startup index scan must never
+enumerate the directory holding it. One scan at startup builds an in-memory
+index, and nothing globs after that. Filenames are a monotonic sequence rather
+than a wall-clock prefix, so an NTP step backwards cannot invert eviction order.
+Evictions and discards are counted and carried on the heartbeat, because the API
+is the system of record and whatever the spool drops is missing from the dataset
+for good.
+
+The archive is a rotating NDJSON ring on a removable device. It is not redundant
+with the Pico's card: it holds GPS position, which the Pico knows nothing about,
+and it comes off the boat without opening the enclosure. **No boat has a stick
+yet, so it ships disabled** and says so once on the heartbeat. Set
+`AQUADRONE_DATA_DEVICE`, or plug in a stick carrying an `aquadrone` directory,
+and it turns on.
+
 ## Install on a boat
 
 BlueOS web UI, Extensions, **Installed** tab, the **+** button, then:
@@ -88,7 +146,7 @@ BlueOS web UI, Extensions, **Installed** tab, the **+** button, then:
 | Extension Identifier | `caddis.manta-link` |
 | Extension Name | `MANTA Link` |
 | Docker image | `ghcr.io/caddis-tech/manta-link` |
-| Docker tag | a pinned version such as `0.3.0` |
+| Docker tag | a pinned version such as `0.4.0` |
 | Custom settings | leave empty; the image's own `permissions` label is used |
 
 Pin the tag rather than using `latest`, so the Extensions Manager shows which
@@ -178,7 +236,7 @@ Tag it. CI runs the tests and validates the manifest against the tag before
 anything is pushed.
 
 ```bash
-git tag v0.3.0
+git tag v0.4.0
 git push --tags
 ```
 

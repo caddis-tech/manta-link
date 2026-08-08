@@ -1,0 +1,475 @@
+"""What a reading becomes, and whose clock it is stamped by.
+
+The Pico is the source of truth on timestamps. This module fills gaps and never
+overrides: the Pico stamps at sampling time, and we can only stamp at receipt,
+one to three seconds later.
+
+It also transforms rather than copies. caddis-api stores the payload as a bare
+JSONField and keeps whatever it is handed, but persisted is not readable: named
+properties over fixed keys are the de-facto schema for the admin, the dashboards
+and every consumer. A verbatim copy of the Pico's keys returns `created` and
+reads back substantively empty, and nothing in the write path says so. That
+failure is silent at every step, which is why the mapping below is the most
+heavily tested code in the package.
+"""
+
+import logging
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any
+
+from . import clock
+from .archive import Archive
+from .health import Counters
+from .logging_setup import Throttle
+from .spool import Spool
+
+log = logging.getLogger(__name__)
+
+SOURCE_PICO = "pico"
+SOURCE_ANCHOR = "link_anchor"
+
+# uuid5 of "manta-link.caddis.tech" under the DNS namespace, frozen as a literal
+# so the derivation can never drift. Every copy of one reading has to resolve to
+# the same API row: the live upload, a retry after a lost acknowledgement, the
+# archive stick and the Pico's card. uuid4 makes each of those a new row, which
+# is what leaves the on-boat backups unpromotable.
+DEVICE_NAMESPACE = uuid.UUID("72908e53-703b-510b-9c7b-8e51084912e2")
+
+# The firmware samples and then emits one to three seconds later, so an anchor
+# derived from the Pi's clock is late by that much. Two seconds is the middle of
+# the range: it bounds the error at a second either way instead of leaving it up
+# to three seconds one way, and this error is systematic, so an uncorrected one
+# skews an entire deployment in the same direction.
+EMIT_LAG_MS = 2000
+
+# Uptime is second-truncated, so consecutive records at the 2.5s cycle always
+# rise. Anything that does not rise is a reset. Anything this far ahead is not
+# the run we anchored to: buffer drops and stalled workers cost minutes, not
+# hours. Both are false-positive tolerant, because a drop only costs a
+# re-derivation from the very next record.
+UPTIME_JUMP_MAX_MS = 3_600_000
+
+# Second-truncated uptime plus the emit-lag estimate makes a few seconds of
+# disagreement expected. Past this the two clocks are telling different stories,
+# and the difference is reported rather than corrected: the Pico's value stands.
+DISAGREEMENT_TOLERANCE_MS = 10_000
+
+ANCHOR_LOG_INTERVAL_S = 60.0
+MAPPING_LOG_INTERVAL_S = 60.0
+
+# Every key the Pico is known to emit. A key outside this set still reaches the
+# payload, but it is counted and named in the log, because an unrecognised key
+# is the shape a new firmware field arrives in and the mapping below is the only
+# thing standing between one and a column nobody can read.
+PICO_KEYS = frozenset({
+    "type",
+    "time",
+    "epoch_ms",
+    "boot_epoch_ms",
+    "sd_ready",
+    "sd_writes_failed",
+    "sd_mounts_failed",
+    "cond_tds_sal",
+    "ph",
+    "temp_code",
+    "temperature",
+    "uv_counts",
+    "uv_mv",
+    "uv_index",
+    "uv_saturated",
+})
+
+# Keys that must not survive into the payload under their own name.
+# `temperature` becomes `water_temperature`, which is the property the API
+# actually reads. `battery_level` is never emitted at all: the API's property
+# turns an explicit null into a zero (caddis-api#77), and a boat reporting a
+# flat battery it does not have is worse than one reporting nothing.
+REPLACED_KEYS = frozenset({"temperature", "battery_level"})
+
+
+@dataclass(frozen=True)
+class Stamp:
+    """What we believe about a record's absolute time, and on whose authority."""
+
+    timestamp_ms: int | None
+    source: str | None
+    uptime_ms: int | None
+
+
+def client_ref_for(raw_line: bytes) -> str:
+    """The row this reading is, in every copy of it that will ever exist.
+
+    Derived from the raw Pico line rather than the envelope, because the
+    envelope carries GPS and a Pi timestamp that differ between a live send and
+    a backfill from the card, and an envelope-derived ref would defeat the whole
+    point. Whitespace is stripped first so a CRLF run and an LF run of the same
+    firmware cannot disagree.
+
+    It has to parse as a real UUID: a non-UUID string is rejected with
+    {"client_ref": ["Must be a valid UUID."]} before payload validation is even
+    reached.
+    """
+    # backslashreplace rather than replace: it is injective, so two lines that
+    # differ only in bytes a lossy decoder would flatten still get two refs.
+    text = raw_line.strip().decode("ascii", "backslashreplace")
+    return str(uuid.uuid5(DEVICE_NAMESPACE, text))
+
+
+def to_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """The Pico's record in the key names caddis-api can actually read."""
+    payload = {
+        key: value for key, value in record.items() if key not in REPLACED_KEYS
+    }
+
+    conductivity, tds, salinity = _split_cond_tds_sal(record.get("cond_tds_sal"))
+    payload["conductivity"] = conductivity
+    payload["tds"] = tds
+    payload["salinity"] = salinity
+    payload["water_temperature"] = _as_number(record.get("temperature"))
+    payload["ph"] = _as_number(record.get("ph"))
+
+    # A value that will not coerce is exactly the one worth keeping the original
+    # of. Nothing reads it, but it is the only evidence of what arrived.
+    if payload["ph"] is None and record.get("ph") is not None:
+        payload["ph_raw"] = record["ph"]
+
+    return payload
+
+
+def unknown_keys(record: dict[str, Any]) -> list[str]:
+    """Keys this mapping has never been told about."""
+    return sorted(set(record) - PICO_KEYS)
+
+
+def uptime_ms_from(record: dict[str, Any]) -> int | None:
+    """Milliseconds since the Pico booted, from the h:mm:ss it prints.
+
+    Second-truncated at the source, which is why two records from either side of
+    a fast reset can carry the same value. AquadronePicoFirmware#28 adds a raw
+    ms_since_boot; this should prefer it once it exists.
+    """
+    text = record.get("time")
+    if not isinstance(text, str):
+        return None
+
+    parts = text.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours, minutes, seconds = (int(part) for part in parts)
+    except ValueError:
+        return None
+    if min(hours, minutes, seconds) < 0 or minutes > 59 or seconds > 59:
+        return None
+
+    return (hours * 3600 + minutes * 60 + seconds) * 1000
+
+
+def resolve_stamp(
+    record: dict[str, Any], uptime_ms: int | None, anchor_ms: int | None
+) -> Stamp:
+    """Apply the precedence: the Pico first, an anchor second, nothing third."""
+    pico_ms = pico_epoch_ms(record)
+    if pico_ms is not None:
+        return Stamp(pico_ms, SOURCE_PICO, uptime_ms)
+    if anchor_ms is not None and uptime_ms is not None:
+        return Stamp(anchor_ms + uptime_ms, SOURCE_ANCHOR, uptime_ms)
+    # No stamp we believe. The record is spooled anyway and stamped later if an
+    # anchor arrives; what it must never do is go to the API unstamped, because
+    # the serializer would fall back to ingest time and a backlog draining after
+    # an outage would land every reading at the moment it drained.
+    return Stamp(None, None, uptime_ms)
+
+
+def build_envelope(
+    raw_line: bytes,
+    record: dict[str, Any],
+    stamp: Stamp,
+    position: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The line as it is spooled, archived, and eventually POSTed."""
+    return {
+        "client_ref": client_ref_for(raw_line),
+        "timestamp_ms": stamp.timestamp_ms,
+        "timestamp_source": stamp.source,
+        # Kept so an entry spooled without a stamp can be stamped at drain time
+        # from an anchor derived after it was written.
+        "uptime_ms": stamp.uptime_ms,
+        # Step 4 fills this, and it is the archive's whole reason for existing:
+        # the Pico's card holds every other field on this line and not this one.
+        "position": position,
+        "payload": to_payload(record),
+    }
+
+
+def is_drainable(envelope: dict[str, Any]) -> bool:
+    """Whether this entry may be uploaded yet.
+
+    A gate, not a correction. The API is create-only, so a resubmitted
+    client_ref returns `duplicate` and never an update: there is no second pass
+    that could fix a timestamp sent wrong the first time.
+    """
+    return envelope.get("timestamp_ms") is not None
+
+
+def stamp_with_anchor(envelope: dict[str, Any], anchor_ms: int) -> dict[str, Any]:
+    """A new envelope carrying the stamp an anchor now makes possible.
+
+    The spooled bytes are left alone. Nothing is overridden either: an entry
+    that already has a stamp comes back untouched.
+    """
+    uptime_ms = envelope.get("uptime_ms")
+    if is_drainable(envelope) or not isinstance(uptime_ms, int):
+        return envelope
+    return {
+        **envelope,
+        "timestamp_ms": anchor_ms + uptime_ms,
+        "timestamp_source": SOURCE_ANCHOR,
+    }
+
+
+def pico_epoch_ms(record: dict[str, Any]) -> int | None:
+    """The Pico's own absolute stamp, or None if it never got one."""
+    value = record.get("epoch_ms")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    # The firmware writes null rather than zero for an unsynced run, so a zero
+    # here is a firmware that changed its mind, not a reading from 1970.
+    return value if value > 0 else None
+
+
+class Anchor:
+    """The epoch of the Pico's boot instant, and the rules for distrusting it.
+
+    Held only while it still describes the run in front of us. The two threads
+    that touch it do so at different depths: the reader only ever sets a flag,
+    which is an attribute store under the GIL, and the capture worker does the
+    arithmetic when it next handles a record.
+    """
+
+    def __init__(self, counters: Counters) -> None:
+        self._counters = counters
+        self._value: int | None = None
+        self._last_uptime_ms: int | None = None
+        self._pending_drop: str | None = None
+        # A drop and the re-derivation after it are a pair, so neither may
+        # swallow the other's line. Throttled at all because a cycle shorter
+        # than the uptime's own second of resolution would log twice a record.
+        self._drop_log = Throttle(ANCHOR_LOG_INTERVAL_S)
+        self._derive_log = Throttle(ANCHOR_LOG_INTERVAL_S)
+
+    @property
+    def value(self) -> int | None:
+        return self._value
+
+    def note_serial_reconnect(self) -> None:
+        """Called from the reader thread on every reopen. The primary rule.
+
+        Any Pico reset forces a USB re-enumeration, so read-error-then-reopen is
+        the one detector that cannot be missed. The banner is not a reliable one
+        on its own: the Pico prints it two seconds after boot without waiting
+        for a host, and pico_stdio_usb discards output outright while DTR is
+        deasserted, which is the state during the re-enumeration itself.
+        """
+        self._pending_drop = "the serial port reconnected"
+
+    def note_banner(self) -> None:
+        """Called from the reader thread when the Pico announces a boot."""
+        self._pending_drop = "the Pico printed its boot banner"
+
+    def for_record(
+        self, uptime_ms: int | None, pico_ms: int | None, received: float
+    ) -> int | None:
+        """The anchor to stamp this record with, re-derived if it had to go."""
+        self._take_pending_drop()
+        self._drop_if_uptime_is_not_believable(uptime_ms)
+        # Only a real uptime replaces the one we compare against. A record with
+        # an unreadable `time` would otherwise blind the next comparison, which
+        # is the direction that keeps a stale anchor rather than dropping a
+        # good one.
+        if uptime_ms is not None:
+            self._last_uptime_ms = uptime_ms
+
+        # Re-derive immediately rather than waiting for the next banner or sync
+        # line. Waiting deadlocks in exactly the case this exists for: a run
+        # whose Pi clock was still undisciplined at boot emits neither.
+        if self._value is None:
+            self._derive(uptime_ms, pico_ms, received)
+        return self._value
+
+    def _take_pending_drop(self) -> None:
+        reason = self._pending_drop
+        if reason is None:
+            return
+        self._pending_drop = None
+        # Uptimes either side of a reconnect are not comparable, so the
+        # monotonic check restarts with the next record rather than firing on
+        # the first one after it.
+        self._last_uptime_ms = None
+        self._drop(reason)
+
+    def _drop_if_uptime_is_not_believable(self, uptime_ms: int | None) -> None:
+        if self._value is None or uptime_ms is None or self._last_uptime_ms is None:
+            return
+
+        step_ms = uptime_ms - self._last_uptime_ms
+        # Not "strictly lower". Uptime is second-truncated on a deterministic
+        # boot sequence, so a reset after exactly one record reproduces the
+        # value we already saw, and equal is not lower.
+        if 0 < step_ms <= UPTIME_JUMP_MAX_MS:
+            return
+
+        if step_ms <= 0:
+            # Also how the ~49.7 day uint32_t millisecond wrap looks, with no
+            # reset behind it. That is a false drop, and re-deriving absorbs it.
+            self._drop(f"uptime went from {self._last_uptime_ms} to {uptime_ms} ms")
+        else:
+            self._drop(f"uptime jumped {step_ms} ms in one record")
+
+    def _drop(self, reason: str) -> None:
+        if self._value is None:
+            return
+        self._value = None
+        self._counters.bump("anchor_dropped")
+        if self._drop_log.should_emit():
+            log.info("dropped the boot-time anchor: %s; %d more suppressed since "
+                     "the last of these", reason, self._drop_log.take_suppressed())
+
+    def _derive(
+        self, uptime_ms: int | None, pico_ms: int | None, received: float
+    ) -> None:
+        if uptime_ms is None:
+            return
+
+        if pico_ms is not None:
+            # Both halves come from the Pico's own clock at sampling time, so
+            # there is no receipt delay and no emit lag to subtract.
+            self._set(pico_ms - uptime_ms, "the Pico's own stamp")
+            return
+
+        if not clock.clock_is_trustworthy():
+            return
+
+        # The reader's receipt time, not the wall clock at parse time. A naive
+        # wall_now - uptime is late by the whole buffer backlog, which is
+        # deepest exactly when this fires, and by the firmware's own gap between
+        # sampling and emitting.
+        backlog_ms = int((time.monotonic() - received) * 1000)
+        observed_ms = clock.epoch_ms_now() - backlog_ms
+        self._set(observed_ms - uptime_ms - EMIT_LAG_MS, "the Pi's clock at receipt")
+
+    def _set(self, value: int, how: str) -> None:
+        self._value = value
+        self._counters.bump("anchor_derived")
+        if self._derive_log.should_emit():
+            log.info("anchored this run's boot at epoch %d ms, from %s", value, how)
+
+
+class Recorder:
+    """The sink capture calls. Where a reading first becomes durable."""
+
+    def __init__(
+        self,
+        spool: Spool,
+        archive: Archive,
+        counters: Counters,
+        anchor: Anchor | None = None,
+    ) -> None:
+        self._spool = spool
+        self._archive = archive
+        self._counters = counters
+        self.anchor = anchor if anchor is not None else Anchor(counters)
+        self._mapping_log = Throttle(MAPPING_LOG_INTERVAL_S)
+        self._disagreement_log = Throttle(MAPPING_LOG_INTERVAL_S)
+
+    def capture(self, raw: bytes, record: dict[str, Any], received: float) -> None:
+        """One parsed record, on the capture thread. Never the reader's."""
+        uptime_ms = uptime_ms_from(record)
+        pico_ms = pico_epoch_ms(record)
+        anchor_ms = self.anchor.for_record(uptime_ms, pico_ms, received)
+
+        self._report_disagreement(pico_ms, anchor_ms, uptime_ms)
+        stamp = resolve_stamp(record, uptime_ms, anchor_ms)
+        self._count_stamp(stamp)
+
+        envelope = build_envelope(raw, record, stamp)
+        self._report_mapping_losses(record, envelope["payload"])
+
+        # Archive first. A spool write that fails still leaves the position on
+        # the stick, and the archive is never coupled to an acknowledgement:
+        # a boat with no token is exactly when a local copy matters most.
+        self._archive.append(envelope)
+        self._spool.put(envelope)
+
+    def _count_stamp(self, stamp: Stamp) -> None:
+        if stamp.source == SOURCE_PICO:
+            self._counters.bump("timestamps_from_pico")
+        elif stamp.source == SOURCE_ANCHOR:
+            self._counters.bump("timestamps_from_anchor")
+        else:
+            self._counters.bump("timestamps_absent")
+
+    def _report_disagreement(
+        self, pico_ms: int | None, anchor_ms: int | None, uptime_ms: int | None
+    ) -> None:
+        """Both clocks answered and they differ. Say so; correct nothing."""
+        if pico_ms is None or anchor_ms is None or uptime_ms is None:
+            return
+
+        difference_ms = pico_ms - (anchor_ms + uptime_ms)
+        if abs(difference_ms) <= DISAGREEMENT_TOLERANCE_MS:
+            return
+
+        self._counters.bump("timestamp_disagreements")
+        if self._disagreement_log.should_emit():
+            log.warning("the Pico's stamp and our anchor disagree by %d ms; "
+                        "keeping the Pico's", difference_ms)
+
+    def _report_mapping_losses(
+        self, record: dict[str, Any], payload: dict[str, Any]
+    ) -> None:
+        """Every silent failure this mapping has, made loud once and counted."""
+        if record.get("cond_tds_sal") is not None and payload["conductivity"] is None:
+            self._counters.bump("cond_tds_sal_unparseable")
+        if record.get("ph") is not None and payload["ph"] is None:
+            self._counters.bump("ph_unparseable")
+
+        unknown = unknown_keys(record)
+        if not unknown:
+            return
+        self._counters.bump("payload_keys_unknown", len(unknown))
+        if self._mapping_log.should_emit():
+            log.warning("the Pico sent key(s) this mapping does not know about "
+                        "(%s); they are stored but nothing can read them",
+                        ", ".join(unknown))
+
+
+def _split_cond_tds_sal(raw: Any) -> tuple[float | None, float | None, float | None]:
+    """One string into the three numbers the API reads as separate columns.
+
+    All three or none: a field with the wrong number of parts is a firmware that
+    changed or a truncated response, and guessing which position is which there
+    would put a salinity in the conductivity column.
+    """
+    if not isinstance(raw, str):
+        return (None, None, None)
+    parts = raw.split(",")
+    if len(parts) != 3:
+        return (None, None, None)
+    return (_as_number(parts[0]), _as_number(parts[1]), _as_number(parts[2]))
+
+
+def _as_number(value: Any) -> float | None:
+    """A float, or None. Never a string, which is what the Pico sends."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None

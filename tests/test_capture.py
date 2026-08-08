@@ -13,7 +13,7 @@ from manta_link.capture import (
 )
 from manta_link.health import Counters
 
-from .test_framing import READING
+from .golden import READING
 
 
 @pytest.fixture
@@ -27,7 +27,7 @@ class TestDraining:
         records.append((READING, 1234.5))
         handed = []
         worker = CaptureWorker(records, new_log_buffer(), counters,
-                               sink=lambda rec, at: handed.append((rec, at)))
+                               sink=lambda raw, rec, at: handed.append((rec, at)))
 
         assert worker.drain_once() == 1
 
@@ -77,7 +77,7 @@ class TestMalformedRecords:
         records.append((b"{not json}", 1.0))
         handed = []
         CaptureWorker(records, new_log_buffer(), counters,
-                      sink=handed.append).drain_once()
+                      sink=lambda raw, rec, at: handed.append(rec)).drain_once()
         assert handed == []
 
     def test_the_reason_is_logged_once_then_suppressed(self, counters, caplog):

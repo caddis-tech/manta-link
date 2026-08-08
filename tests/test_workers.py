@@ -90,7 +90,7 @@ class TestUnderFullLoad:
         logs = new_log_buffer()
 
         worker = CaptureWorker(
-            records, logs, counters, sink=lambda rec, at: time.sleep(SLOW_SPOOL_S)
+            records, logs, counters, sink=lambda raw, rec, at: time.sleep(SLOW_SPOOL_S)
         )
         health = Health(counters)
         health.register("capture", worker.run_forever)
@@ -192,7 +192,8 @@ class TestReleaseBoat:
         logs = new_log_buffer()
         uploaded = []
 
-        worker = CaptureWorker(records, logs, counters, sink=uploaded.append)
+        worker = CaptureWorker(records, logs, counters,
+                               sink=lambda raw, rec, at: uploaded.append(rec))
         health = Health(counters, heartbeat_interval_s=0.0)
 
         program = (

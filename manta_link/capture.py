@@ -2,8 +2,8 @@
 
 The reader appends raw bytes and a monotonic receipt time to a deque and goes
 straight back to read(). This worker does the parsing, the counting and the
-talking. Today that is all it does: spooling, the record envelope and the
-upload arrive in later steps, and the `sink` seam below is where they attach.
+talking, and hands each record to the `sink`, which is where the envelope is
+built and spooled. The upload attaches to the same seam.
 """
 
 import json
@@ -31,7 +31,10 @@ SUMMARY_INTERVAL_S = 60.0
 BAD_RECORD_LOG_INTERVAL_S = 60.0
 BACKLOG_LOG_INTERVAL_S = 60.0
 
-RecordSink = Callable[[dict[str, Any], float], None]
+# The raw line travels with the parsed record because client_ref is a uuid5 of
+# the bytes the Pico sent. Re-serialising the parsed dict would not reproduce
+# them, and every copy of a reading has to hash to the same row.
+RecordSink = Callable[[bytes, dict[str, Any], float], None]
 
 
 def new_record_buffer() -> "deque[tuple[bytes, float]]":
@@ -122,7 +125,7 @@ class CaptureWorker:
 
         self._counters.bump("records_captured")
         if self._sink is not None:
-            self._sink(record, received)
+            self._sink(raw, record, received)
 
     def _report_bad_record(self, reason: str) -> None:
         """Loud once, then counted.

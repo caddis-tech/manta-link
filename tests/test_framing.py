@@ -8,6 +8,8 @@ import pytest
 
 from manta_link.framing import MAX_LINE, Kind, LineAssembler, classify, parse_banner
 
+from .golden import READING
+
 # Lines the firmware actually emits, copied from my_project.c rather than
 # paraphrased. If any of these ever classifies as a record or a time request,
 # the reader either tries to parse a log line or answers a request nobody made.
@@ -27,13 +29,6 @@ FIRMWARE_LOG_LINES = [
 
 BANNER = b"=== Aquadrone firmware 2.0.0: SD LOGGING ENABLED ==="
 DEBUG_BANNER = b"=== Aquadrone firmware 2.0.0: SD LOGGING DISABLED ==="
-
-READING = (
-    b'{"type":"reading","time":"0:01:12","epoch_ms":1754400072000,"sd_ready":1,'
-    b'"sd_writes_failed":0,"sd_mounts_failed":0,"cond_tds_sal":"210,105,0.10",'
-    b'"ph":"7.234","temp_code":"0x1A2B","temperature":18.4,"uv_counts":812,'
-    b'"uv_mv":655,"uv_index":3.1,"uv_saturated":0}'
-)
 
 
 def collect(assembler: LineAssembler, chunks) -> list:

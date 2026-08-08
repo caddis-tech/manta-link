@@ -10,7 +10,8 @@ from manta_link import reader as reader_mod
 from manta_link.reader import SerialReader
 
 from .fakes import FakeSerial, StopPlayback
-from .test_framing import BANNER, DEBUG_BANNER, READING
+from .golden import READING
+from .test_framing import BANNER, DEBUG_BANNER
 
 EPOCH_MS = 1_754_400_000_000
 

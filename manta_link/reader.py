@@ -67,10 +67,17 @@ class SerialReader:
         records: "deque[tuple[bytes, float]] | None" = None,
         logs: "deque[bytes] | None" = None,
         on_tick: Callable[[], None] | None = None,
+        on_reconnect: Callable[[], None] | None = None,
+        on_banner: Callable[[], None] | None = None,
     ) -> None:
         self._records = records
         self._logs = logs
         self._on_tick = on_tick
+        # Both exist for the boot-time anchor. The reconnect is the reliable
+        # half: any Pico reset forces a USB re-enumeration, while a banner can
+        # be printed into a deasserted DTR and never arrive at all.
+        self._on_reconnect = on_reconnect
+        self._on_banner = on_banner
         self._assembler = LineAssembler()
         self._last_absent_log = 0.0
         self.answered_count = 0
@@ -102,8 +109,10 @@ class SerialReader:
             finally:
                 self.connected = False
                 # A reconnect means the Pico re-enumerated, so any bytes still
-                # buffered belong to a run that has ended.
+                # buffered belong to a run that has ended, and so does anything
+                # derived from that run's uptime.
                 self._assembler.reset()
+                self._notify(self._on_reconnect, "reconnect notice")
 
             time.sleep(RECONNECT_DELAY_S)
 
@@ -156,15 +165,19 @@ class SerialReader:
         death. This loop is the only context guaranteed to still be running,
         and it already wakes every read timeout.
         """
-        if self._on_tick is None:
+        self._notify(self._on_tick, "health check")
+
+    def _notify(self, callback: "Callable[[], None] | None", what: str) -> None:
+        """Tell something off-thread, without letting it cost us the port."""
+        if callback is None:
             return
         try:
-            self._on_tick()
+            callback()
         except Exception:
-            # A bug in the watchdog must not cost the port its owner. Reporting
-            # it and reading on is strictly better than reopening the port,
-            # which is the one event that can lose an in-flight TIME?.
-            log.exception("health check failed; continuing to read")
+            # A bug in a listener must not cost the port its owner. Reporting it
+            # and reading on is strictly better than reopening the port, which
+            # is the one event that can lose an in-flight TIME?.
+            log.exception("%s failed; continuing to read", what)
 
     def _claim_exclusive(self, link: serial.Serial) -> None:
         if _TIOCEXCL is None:
@@ -191,6 +204,7 @@ class SerialReader:
             return
 
         if kind is Kind.BANNER:
+            self._notify(self._on_banner, "banner notice")
             parsed = parse_banner(line)
             if parsed is not None:
                 version, state = parsed
