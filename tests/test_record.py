@@ -27,7 +27,7 @@ from manta_link.record import (
 )
 
 from .fakes import FakeSerial, StopPlayback
-from .golden import READING
+from .golden import READING, SATURATED_READING
 
 # The golden line's own values, so a test says what it means rather than
 # repeating a literal that has to be kept in step with the file.
@@ -37,6 +37,11 @@ BOOT_EPOCH_MS = PICO_EPOCH_MS - UPTIME_MS
 
 # A wall clock far enough from the Pico's stamp to be unmistakable in a failure.
 PI_EPOCH_MS = 1_754_500_000_000
+
+# Two Pico runs, named rather than generated, so a test that crosses the
+# boundary says which side it is on.
+RUN_A = "e0a1c5be-0000-4000-8000-00000000000a"
+RUN_B = "e0a1c5be-0000-4000-8000-00000000000b"
 
 
 @pytest.fixture
@@ -60,6 +65,24 @@ def reading(**overrides) -> dict:
     parsed = json.loads(READING)
     parsed.update(overrides)
     return parsed
+
+
+def unstamped_line(sample_ms: int) -> bytes:
+    """The wire line for an unsynced sample this far into the run.
+
+    The firmware renders uptime as h:mm:ss and nothing else in an unsynced
+    record carries time, so the sub-second part of sample_ms has nowhere to go.
+    That is the collision below, modelled here rather than asserted about one
+    byte string twice.
+    """
+    seconds = sample_ms // 1000
+    stamp = f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+    fields: dict = {"epoch_ms": None, "time": stamp}
+    # AquadronePicoFirmware#28. The day the golden line carries raw milliseconds,
+    # these samples stop colliding and the test below is what says so.
+    if "ms_since_boot" in reading():
+        fields["ms_since_boot"] = sample_ms
+    return json.dumps(reading(**fields)).encode()
 
 
 class RecordingSpool:
@@ -105,13 +128,24 @@ class TestFieldMapping:
             "tds": 105.0,
             "salinity": 0.1,
             "ph": 7.234,
-            "temp_code": "0x1A2B",
+            "temp_code": "0x1a2b",
             "water_temperature": 18.4,
             "uv_counts": 812,
-            "uv_mv": 655,
-            "uv_index": 3.1,
-            "uv_saturated": 0,
+            "uv_mv": 654,
+            "uv_index": 5,
+            "uv_saturated": False,
         }
+
+    def test_the_saturated_line_keeps_its_null_and_its_boolean(self):
+        """A UV reading off the top of the ladder is the one record where a
+        mapped field is a JSON boolean and another is an explicit null. Neither
+        goes through _as_number, and a coercion added there later would turn
+        the boolean into a null and lose the distinction the firmware is at
+        pains to keep."""
+        payload = record.to_payload(json.loads(SATURATED_READING))
+        assert payload["uv_index"] is None
+        assert payload["uv_saturated"] is True
+        assert payload["uv_mv"] == 1128
 
     def test_temperature_is_renamed_rather_than_duplicated(self):
         payload = record.to_payload(reading())
@@ -229,28 +263,37 @@ class TestClientRef:
             READING
         )
 
-    def test_two_unstamped_records_with_the_same_uptime_collide(self):
+    def test_two_unstamped_samples_inside_one_second_collide(self):
         """The known collision, asserted rather than trusted to the cadence.
 
-        Records with no epoch_ms and identical second-truncated uptimes are the
-        same bytes, so they are the same row. The 2.5s cycle floor makes that
-        unreachable today, but #44 (re-measure cadence) and #28 (raw
-        ms_since_boot) both move it, and this is where that shows up.
+        Two readings 400 ms apart with no epoch_ms carry the same
+        second-truncated uptime and nothing else that tells them apart, so they
+        are one row: the second comes back `duplicate` and is lost. The 2.5s
+        cycle floor makes that unreachable today, but #44 (re-measure cadence)
+        and #28 (raw ms_since_boot) both move it, and this is where that shows
+        up.
         """
-        unstamped = json.dumps(reading(epoch_ms=None)).encode()
-        assert record.client_ref_for(unstamped) == record.client_ref_for(unstamped)
+        assert record.client_ref_for(unstamped_line(72_000)) == record.client_ref_for(
+            unstamped_line(72_400)
+        )
+
+    def test_unstamped_samples_a_second_apart_stay_two_rows(self):
+        assert record.client_ref_for(unstamped_line(72_000)) != record.client_ref_for(
+            unstamped_line(73_000)
+        )
 
     def test_an_envelope_field_cannot_change_it(self):
         """Derived from the raw line, never the envelope. GPS and the Pi's
         receipt time differ between a live send and a backfill, and an
         envelope-derived ref would make those two different rows."""
         live = record.build_envelope(
-            READING, reading(), Stamp(PICO_EPOCH_MS, SOURCE_PICO, UPTIME_MS)
+            READING, reading(), Stamp(PICO_EPOCH_MS, SOURCE_PICO, UPTIME_MS), RUN_A
         )
         backfilled = record.build_envelope(
             READING,
             reading(),
             Stamp(PICO_EPOCH_MS, SOURCE_PICO, UPTIME_MS),
+            RUN_B,
             position={"lat": 44.1, "lon": -70.2},
         )
         assert live["client_ref"] == backfilled["client_ref"]
@@ -300,7 +343,7 @@ class TestTimestampPrecedence:
 class TestDrainability:
     def test_an_unstamped_entry_is_not_drainable(self):
         envelope = record.build_envelope(
-            READING, reading(epoch_ms=None), Stamp(None, None, UPTIME_MS)
+            READING, reading(epoch_ms=None), Stamp(None, None, UPTIME_MS), RUN_A
         )
         assert not record.is_drainable(envelope)
 
@@ -309,10 +352,10 @@ class TestDrainability:
         client_ref returns `duplicate` and never an update: a timestamp sent
         wrong the first time stays wrong."""
         spooled = record.build_envelope(
-            READING, reading(epoch_ms=None), Stamp(None, None, UPTIME_MS)
+            READING, reading(epoch_ms=None), Stamp(None, None, UPTIME_MS), RUN_A
         )
 
-        stamped = record.stamp_with_anchor(spooled, BOOT_EPOCH_MS)
+        stamped = record.stamp_with_anchor(spooled, BOOT_EPOCH_MS, RUN_A)
 
         assert record.is_drainable(stamped)
         assert stamped["timestamp_ms"] == PICO_EPOCH_MS
@@ -324,16 +367,41 @@ class TestDrainability:
 
     def test_an_anchor_never_overrides_a_stamp_the_pico_gave(self):
         spooled = record.build_envelope(
-            READING, reading(), Stamp(PICO_EPOCH_MS, SOURCE_PICO, UPTIME_MS)
+            READING, reading(), Stamp(PICO_EPOCH_MS, SOURCE_PICO, UPTIME_MS), RUN_A
         )
-        assert record.stamp_with_anchor(spooled, 1) is spooled
+        assert record.stamp_with_anchor(spooled, 1, RUN_A) is spooled
 
     def test_an_entry_with_no_uptime_can_never_be_stamped(self):
         envelope = record.build_envelope(
-            READING, reading(epoch_ms=None, time="junk"), Stamp(None, None, None)
+            READING, reading(epoch_ms=None, time="junk"), Stamp(None, None, None), RUN_A
         )
-        stamped = record.stamp_with_anchor(envelope, BOOT_EPOCH_MS)
+        stamped = record.stamp_with_anchor(envelope, BOOT_EPOCH_MS, RUN_A)
         assert not record.is_drainable(stamped)
+
+    def test_an_anchor_from_a_later_run_leaves_an_older_entry_alone(self):
+        """The failure this whole field exists for.
+
+        A run whose Pi clock was undisciplined spools unstamped entries; the
+        Pico resets; the clock syncs and the next run derives an anchor. Stamped
+        from that one, every entry of the first run shifts forward by the gap
+        between the two boots, and the result is plausible, drainable and
+        permanent.
+        """
+        spooled = record.build_envelope(
+            READING, reading(epoch_ms=None), Stamp(None, None, UPTIME_MS), RUN_A
+        )
+
+        stamped = record.stamp_with_anchor(spooled, BOOT_EPOCH_MS + 86_400_000, RUN_B)
+
+        assert stamped is spooled
+        assert not record.is_drainable(stamped)
+
+    def test_an_entry_spooled_before_this_format_is_never_stamped(self):
+        """A format without a run id cannot say which run it is from, so the
+        only honest answer is the give-up rule: it stays spooled and the Pico's
+        card is the copy that survives."""
+        older = {"client_ref": "x", "timestamp_ms": None, "uptime_ms": UPTIME_MS}
+        assert record.stamp_with_anchor(older, BOOT_EPOCH_MS, RUN_A) is older
 
 
 class TestAnchorDerivation:
@@ -457,6 +525,60 @@ class TestAnchorInvalidation:
         assert anchor.value is not None
 
 
+class TestRunIdentity:
+    """Which boot an uptime counts from, which is the only thing that makes a
+    deferred stamp safe."""
+
+    def test_the_ordinary_cycle_stays_one_run(self, counters, unsynced_clock):
+        anchor = Anchor(counters)
+        anchor.for_record(UPTIME_MS, PICO_EPOCH_MS, time.monotonic())
+        before = anchor.run_id
+
+        anchor.for_record(UPTIME_MS + 2_500, None, time.monotonic())
+
+        assert anchor.run_id == before
+
+    def test_a_reconnect_starts_a_new_run(self, counters, unsynced_clock):
+        anchor = Anchor(counters)
+        anchor.for_record(UPTIME_MS, PICO_EPOCH_MS, time.monotonic())
+        before = anchor.run_id
+
+        anchor.note_serial_reconnect()
+        anchor.for_record(1_000, None, time.monotonic())
+
+        assert anchor.run_id != before
+
+    def test_a_run_that_never_anchored_still_ends(self, counters, unsynced_clock):
+        """The case the anchor's own drop rule cannot see. A run with an
+        undisciplined Pi clock holds no anchor to lose, and its records are
+        exactly the ones the next run's anchor must not reach."""
+        anchor = Anchor(counters)
+        anchor.for_record(UPTIME_MS, None, time.monotonic())
+        assert anchor.value is None
+        before = anchor.run_id
+
+        anchor.note_serial_reconnect()
+        anchor.for_record(1_000, None, time.monotonic())
+
+        assert anchor.run_id != before
+
+    def test_uptime_going_backwards_ends_it_too(self, counters, unsynced_clock):
+        """The backstop for a reset the reconnect somehow missed."""
+        anchor = Anchor(counters)
+        anchor.for_record(UPTIME_MS, None, time.monotonic())
+        before = anchor.run_id
+
+        anchor.for_record(1_000, None, time.monotonic())
+
+        assert anchor.run_id != before
+
+    def test_two_processes_never_share_one(self, counters):
+        """A restart mints a new identity even where the Pico kept running, so
+        entries spooled unstamped before it are given up rather than stamped
+        from an anchor nothing can prove is theirs."""
+        assert Anchor(counters).run_id != Anchor(counters).run_id
+
+
 class TestTheReaderDrivesTheAnchor:
     def test_a_reconnect_drops_it_with_no_banner_anywhere(self, monkeypatch, counters):
         """The detector that cannot be missed.
@@ -533,6 +655,46 @@ class TestRecorder:
         assert spool.entries[0]["timestamp_ms"] is None
         assert spool.entries[0]["uptime_ms"] == UPTIME_MS
         assert counters.get("timestamps_absent") == 1
+
+    def test_an_entry_carries_the_run_its_uptime_counts_from(
+        self, counters, unsynced_clock
+    ):
+        """Read after the anchor has seen the record, not before: a record on
+        the far side of a reset belongs to the run that started there."""
+        calls: list[str] = []
+        spool = RecordingSpool(calls)
+        recorder = Recorder(spool, RecordingArchive(calls), counters)
+        line = json.dumps(reading(epoch_ms=None)).encode()
+
+        recorder.capture(line, reading(epoch_ms=None), time.monotonic())
+        first_run = recorder.anchor.run_id
+        recorder.anchor.note_serial_reconnect()
+        recorder.capture(line, reading(epoch_ms=None), time.monotonic())
+
+        assert spool.entries[0]["run_id"] == first_run
+        assert spool.entries[1]["run_id"] == recorder.anchor.run_id
+        assert spool.entries[1]["run_id"] != first_run
+
+    def test_a_partly_unparseable_cond_tds_sal_is_counted(self, counters):
+        """An Atlas *ER in the middle position leaves conductivity intact and
+        drops tds, so a counter keyed to the first part alone never fires and
+        the record uploads with no evidence a value was lost."""
+        calls: list[str] = []
+        recorder = Recorder(RecordingSpool(calls), RecordingArchive(calls), counters)
+
+        recorder.capture(
+            READING, reading(cond_tds_sal="210,*ER,0.10"), time.monotonic()
+        )
+
+        assert counters.get("cond_tds_sal_unparseable") == 1
+
+    def test_a_wholly_readable_cond_tds_sal_is_not_counted(self, counters):
+        calls: list[str] = []
+        recorder = Recorder(RecordingSpool(calls), RecordingArchive(calls), counters)
+
+        recorder.capture(READING, reading(), time.monotonic())
+
+        assert counters.get("cond_tds_sal_unparseable") == 0
 
     def test_the_stamp_source_is_counted(self, counters):
         calls: list[str] = []

@@ -187,6 +187,7 @@ def build_envelope(
     raw_line: bytes,
     record: dict[str, Any],
     stamp: Stamp,
+    run_id: str,
     position: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The line as it is spooled, archived, and eventually POSTed."""
@@ -197,6 +198,11 @@ def build_envelope(
         # Kept so an entry spooled without a stamp can be stamped at drain time
         # from an anchor derived after it was written.
         "uptime_ms": stamp.uptime_ms,
+        # Which Pico run that uptime counts from. An uptime means nothing
+        # outside its own run, and this is the only place the run survives: a
+        # restart of this process loses every in-memory way of telling two of
+        # them apart.
+        "run_id": run_id,
         # Step 4 fills this, and it is the archive's whole reason for existing:
         # the Pico's card holds every other field on this line and not this one.
         "position": position,
@@ -214,14 +220,21 @@ def is_drainable(envelope: dict[str, Any]) -> bool:
     return envelope.get("timestamp_ms") is not None
 
 
-def stamp_with_anchor(envelope: dict[str, Any], anchor_ms: int) -> dict[str, Any]:
+def stamp_with_anchor(
+    envelope: dict[str, Any], anchor_ms: int, run_id: str
+) -> dict[str, Any]:
     """A new envelope carrying the stamp an anchor now makes possible.
 
     The spooled bytes are left alone. Nothing is overridden either: an entry
-    that already has a stamp comes back untouched.
+    that already has a stamp comes back untouched, and so does one belonging to
+    any run but the one this anchor describes. An anchor from the run after a
+    reset would shift a whole spool by the gap between the two boots, and the
+    result is plausible, drainable and permanent.
     """
     uptime_ms = envelope.get("uptime_ms")
     if is_drainable(envelope) or not isinstance(uptime_ms, int):
+        return envelope
+    if envelope.get("run_id") != run_id:
         return envelope
     return {
         **envelope,
@@ -252,6 +265,7 @@ class Anchor:
     def __init__(self, counters: Counters) -> None:
         self._counters = counters
         self._value: int | None = None
+        self._run_id = _new_run_id()
         self._last_uptime_ms: int | None = None
         self._pending_drop: str | None = None
         # A drop and the re-derivation after it are a pair, so neither may
@@ -263,6 +277,17 @@ class Anchor:
     @property
     def value(self) -> int | None:
         return self._value
+
+    @property
+    def run_id(self) -> str:
+        """Which Pico run the records in front of us belong to.
+
+        A restart of this process mints a new one even where the Pico kept
+        running, so entries spooled unstamped before it are evicted rather than
+        stamped from an anchor nothing can prove is theirs. That is the give-up
+        rule: the Pico's card is the copy that survives.
+        """
+        return self._run_id
 
     def note_serial_reconnect(self) -> None:
         """Called from the reader thread on every reopen. The primary rule.
@@ -311,7 +336,10 @@ class Anchor:
         self._drop(reason)
 
     def _drop_if_uptime_is_not_believable(self, uptime_ms: int | None) -> None:
-        if self._value is None or uptime_ms is None or self._last_uptime_ms is None:
+        # Runs whether or not an anchor is held. A run that never got one still
+        # spools records, and they still have to be told apart from the next
+        # run's.
+        if uptime_ms is None or self._last_uptime_ms is None:
             return
 
         step_ms = uptime_ms - self._last_uptime_ms
@@ -329,6 +357,10 @@ class Anchor:
             self._drop(f"uptime jumped {step_ms} ms in one record")
 
     def _drop(self, reason: str) -> None:
+        # The run identity goes even when there is no anchor to lose, because
+        # the records already spooled from the run that just ended are exactly
+        # the ones the next anchor must not reach.
+        self._run_id = _new_run_id()
         if self._value is None:
             return
         self._value = None
@@ -394,7 +426,9 @@ class Recorder:
         stamp = resolve_stamp(record, uptime_ms, anchor_ms)
         self._count_stamp(stamp)
 
-        envelope = build_envelope(raw, record, stamp)
+        # The run id is read after for_record, which is what rotates it: a
+        # record arriving on the far side of a reset belongs to the new run.
+        envelope = build_envelope(raw, record, stamp, self.anchor.run_id)
         self._report_mapping_losses(record, envelope["payload"])
 
         # Archive first. A spool write that fails still leaves the position on
@@ -431,7 +465,13 @@ class Recorder:
         self, record: dict[str, Any], payload: dict[str, Any]
     ) -> None:
         """Every silent failure this mapping has, made loud once and counted."""
-        if record.get("cond_tds_sal") is not None and payload["conductivity"] is None:
+        # Any of the three, not only the first. An Atlas *ER in the middle
+        # position leaves conductivity intact and drops tds, and the record
+        # uploads with nothing anywhere to say a value was lost.
+        from_cond_tds_sal = ("conductivity", "tds", "salinity")
+        if record.get("cond_tds_sal") is not None and any(
+            payload[key] is None for key in from_cond_tds_sal
+        ):
             self._counters.bump("cond_tds_sal_unparseable")
         if record.get("ph") is not None and payload["ph"] is None:
             self._counters.bump("ph_unparseable")
@@ -444,6 +484,15 @@ class Recorder:
             log.warning("the Pico sent key(s) this mapping does not know about "
                         "(%s); they are stored but nothing can read them",
                         ", ".join(unknown))
+
+
+def _new_run_id() -> str:
+    """A fresh identity for the Pico run now in front of us.
+
+    Random rather than derived from anything on the wire, because the run this
+    has to identify is precisely the one with no epoch_ms and no anchor yet.
+    """
+    return str(uuid.uuid4())
 
 
 def _split_cond_tds_sal(raw: Any) -> tuple[float | None, float | None, float | None]:

@@ -94,7 +94,10 @@ the position on the stick.
 and we can only stamp at receipt, one to three seconds later, so this fills gaps
 and never overrides. A record with `epoch_ms` keeps it. A record without one is
 stamped from the run's boot anchor, if there is one. A record with neither is
-spooled unstamped and becomes eligible to upload the moment an anchor arrives.
+spooled unstamped and becomes eligible the moment an anchor for *its own run*
+arrives: every entry carries the identity of the boot its uptime counts from,
+because stamping one from a later run's anchor shifts it by the gap between the
+two boots and nothing afterwards can tell.
 Nothing unstamped is ever uploaded: the API's `timestamp` falls back to *ingest*
 time, so a backlog draining after an outage would land every reading at the
 moment it drained, and there is no correcting it afterwards because a
