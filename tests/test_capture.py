@@ -1,5 +1,6 @@
 """Capture does the work the reader refuses to do, and says little about it."""
 
+import threading
 import time
 from collections import deque
 
@@ -11,7 +12,7 @@ from manta_link.capture import (
     new_log_buffer,
     new_record_buffer,
 )
-from manta_link.health import Counters
+from manta_link.health import Counters, Health
 
 from .golden import READING
 
@@ -115,6 +116,63 @@ class TestBacklog:
         records.append((READING, 1.0))
         CaptureWorker(records, new_log_buffer(), counters).drain_once()
         assert counters.get("record_buffer_full") == 0
+
+
+class TestDroppedRecords:
+    """Building the worker is what points a buffer at the tallies, as __main__ does."""
+
+    def test_a_stalled_sink_loses_records_and_every_loss_is_counted(self, counters):
+        """The failure this counter exists for: a 20 minute fsync retry.
+
+        The worker is inside the sink while the buffer overruns, so the backlog
+        hint at the top of drain_once cannot fire and the deque itself reports
+        nothing. Without a tally at the append, 144 readings leave no trace.
+        """
+        fed = RECORD_BUFFER_MAX + 145
+        records = new_record_buffer()
+        stalled = threading.Event()
+        release = threading.Event()
+
+        def stalling_sink(raw, record, at):
+            if not stalled.is_set():
+                stalled.set()
+                assert release.wait(5.0), "the sink was never released"
+
+        worker = CaptureWorker(records, new_log_buffer(), counters,
+                               sink=stalling_sink)
+        records.append((READING, 1.0))
+        drain = threading.Thread(target=worker.drain_once, daemon=True)
+        drain.start()
+        assert stalled.wait(5.0), "the worker never reached the sink"
+
+        for _ in range(fed - 1):
+            records.append((READING, 2.0))
+        release.set()
+        drain.join(5.0)
+        assert not drain.is_alive(), "the drain never finished"
+
+        assert counters.get("records_dropped") == 144
+        captured = counters.get("records_captured")
+        assert captured + counters.get("records_dropped") == fed
+
+    def test_the_loss_reaches_the_heartbeat(self, counters, caplog):
+        """The heartbeat is the only outbound signal a Release boat has."""
+        records = new_record_buffer()
+        CaptureWorker(records, new_log_buffer(), counters)
+        for _ in range(RECORD_BUFFER_MAX + 3):
+            records.append((READING, 1.0))
+
+        with caplog.at_level("INFO"):
+            Health(counters, heartbeat_interval_s=0.0).tick()
+
+        assert "records_dropped=3" in caplog.text
+
+    def test_a_buffer_that_never_fills_reports_no_drops(self, counters):
+        records = new_record_buffer()
+        CaptureWorker(records, new_log_buffer(), counters)
+        for _ in range(RECORD_BUFFER_MAX):
+            records.append((READING, 1.0))
+        assert counters.get("records_dropped") == 0
 
 
 class TestSummary:

@@ -37,8 +37,33 @@ BACKLOG_LOG_INTERVAL_S = 60.0
 RecordSink = Callable[[bytes, dict[str, Any], float], None]
 
 
-def new_record_buffer() -> "deque[tuple[bytes, float]]":
-    return deque(maxlen=RECORD_BUFFER_MAX)
+class RecordBuffer(deque[tuple[bytes, float]]):
+    """The reader's drop box, which says how much it has thrown away.
+
+    An eviction is only observable here, at the append, on the reader's thread:
+    a deque at maxlen discards the oldest and returns nothing. The worker cannot
+    see it afterwards, because the only evidence is records that never arrived.
+    """
+
+    def __init__(self, maxlen: int) -> None:
+        super().__init__(maxlen=maxlen)
+        self._counters: Counters | None = None
+
+    def count_drops_into(self, counters: Counters) -> None:
+        """Send evictions to the tallies the heartbeat prints."""
+        self._counters = counters
+
+    def append(self, item: tuple[bytes, float]) -> None:
+        if self._counters is not None and len(self) == self.maxlen:
+            # Racing the worker's popleft can over-report by one. Closing that
+            # would need a lock on the one thread that must never wait, and
+            # over-reporting a loss is the safe direction to be wrong in.
+            self._counters.bump("records_dropped")
+        super().append(item)
+
+
+def new_record_buffer() -> RecordBuffer:
+    return RecordBuffer(RECORD_BUFFER_MAX)
 
 
 def new_log_buffer() -> "deque[bytes]":
@@ -63,6 +88,10 @@ class CaptureWorker:
         self._backlog_log = Throttle(BACKLOG_LOG_INTERVAL_S)
         self._last_summary = 0.0
         self._summarised_total = 0
+        # The worker is the only thing holding both the buffer and the tallies,
+        # and it is built before the reader has a thread to append from.
+        if isinstance(records, RecordBuffer):
+            records.count_drops_into(counters)
 
     def run_forever(self) -> None:
         """Never returns. Supervised, and restarted if it ever does."""
@@ -103,7 +132,11 @@ class CaptureWorker:
         return handled
 
     def _warn_if_backlogged(self) -> None:
-        """A full buffer means the reader has already dropped older records."""
+        """A hint only. The drops themselves are tallied at the append.
+
+        This runs once per drain, and the stall that causes an eviction is the
+        sink call inside that drain, so catching the buffer full here is luck.
+        """
         capacity = self._records.maxlen
         if capacity is None or len(self._records) < capacity:
             return

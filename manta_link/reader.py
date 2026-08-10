@@ -20,6 +20,7 @@ import serial
 
 from . import clock
 from .framing import Kind, LineAssembler, classify, parse_banner
+from .logging_setup import Throttle
 from .portfinder import BAUD, find_pico_port
 
 # TIOCEXCL is Linux-only and this package is developed on Windows, so the
@@ -79,7 +80,7 @@ class SerialReader:
         self._on_reconnect = on_reconnect
         self._on_banner = on_banner
         self._assembler = LineAssembler()
-        self._last_absent_log = 0.0
+        self._absent_log = Throttle(ABSENT_LOG_INTERVAL_S)
         self.answered_count = 0
         self.connected = False
 
@@ -117,10 +118,8 @@ class SerialReader:
             time.sleep(RECONNECT_DELAY_S)
 
     def _log_absent(self) -> None:
-        now = time.monotonic()
-        if now - self._last_absent_log >= ABSENT_LOG_INTERVAL_S:
+        if self._absent_log.should_emit():
             log.info("no Pico (USB VID 0x2E8A) present; waiting")
-            self._last_absent_log = now
 
     def _serve(self, port_path: str) -> None:
         """Answer requests on one port until it goes away."""
@@ -137,7 +136,10 @@ class SerialReader:
         ) as link:
             self._claim_exclusive(link)
             self.connected = True
-            self._last_absent_log = 0.0
+            # Replaced rather than zeroed: monotonic counts from host boot, so a
+            # zeroed "last logged" would suppress the next absence for five more
+            # minutes instead of reporting the Pico's disappearance at once.
+            self._absent_log = Throttle(ABSENT_LOG_INTERVAL_S)
             log.info("listening on %s", port_path)
 
             last_alive = time.monotonic()

@@ -1,5 +1,6 @@
 """The reader's one obligation, and the ways it used to be dodgeable."""
 
+import time
 from collections import deque
 
 import pytest
@@ -112,6 +113,59 @@ class TestWriteHang:
         assert opened["write_timeout"] == reader_mod.WRITE_TIMEOUT_S
         assert opened["exclusive"] is True
         assert opened["timeout"] == reader_mod.READ_TIMEOUT_S
+
+
+class TestAbsentPico:
+    def test_the_first_absence_is_logged_however_long_the_host_has_been_up(
+        self, monkeypatch, caplog
+    ):
+        """monotonic counts from host boot, not from this process starting.
+
+        Kraken starts the extension around 45s of uptime, and the bench window
+        where somebody is replugging the Pico is the five minutes after that.
+        """
+        monkeypatch.setattr(time, "monotonic", lambda: 45.0)
+        rdr = SerialReader()
+
+        with caplog.at_level("INFO"):
+            rdr._log_absent()
+
+        assert "no Pico" in caplog.text
+
+    def test_an_absence_after_a_connection_is_logged_at_once(
+        self, monkeypatch, caplog
+    ):
+        """Connect, then vanish, which is what unplugging the cable looks like.
+
+        The interval has to start again from the connection, so the second
+        absence is audible without waiting five minutes for it.
+        """
+        monkeypatch.setattr(time, "monotonic", lambda: 45.0)
+        rdr = SerialReader()
+        rdr._log_absent()
+
+        monkeypatch.setattr(reader_mod.serial, "Serial",
+                            FakeSerial.factory(chunks=[BANNER + b"\r\n"]))
+        with pytest.raises(StopPlayback):
+            rdr._serve("/dev/fake")
+
+        with caplog.at_level("INFO"):
+            rdr._log_absent()
+
+        assert "no Pico" in caplog.text
+
+    def test_a_second_absence_inside_the_interval_stays_quiet(
+        self, monkeypatch, caplog
+    ):
+        """At the reconnect delay this line is 43,200 a day into a capped history."""
+        monkeypatch.setattr(time, "monotonic", lambda: 45.0)
+        rdr = SerialReader()
+        rdr._log_absent()
+
+        with caplog.at_level("INFO"):
+            rdr._log_absent()
+
+        assert "no Pico" not in caplog.text
 
 
 class TestDispatch:
