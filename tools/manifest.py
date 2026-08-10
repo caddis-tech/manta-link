@@ -6,7 +6,8 @@ simply fails, looking like a missing tag or a bad image. That failure is only
 discoverable on a boat, so it gets caught here instead.
 
 Usable two ways: imported by the test suite, or run in CI with the release tag
-as its argument to assert the version LABEL agrees with it.
+as its argument to assert the version LABEL agrees with it. A run with no tag to
+agree with passes NO_TAG_GATE to check everything else.
 """
 
 from __future__ import annotations
@@ -26,6 +27,11 @@ REQUIRED_LABELS = ("version", "permissions")
 
 _LABEL_RE = re.compile(r"^LABEL\s+(?P<key>[a-zA-Z_][\w.-]*)=(?P<value>.*)$")
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+# Passed instead of a tag by a workflow_dispatch run, which has no tag for the
+# version to agree with. The publish workflow spells this literally; keep them
+# in step.
+NO_TAG_GATE = "--no-tag"
 
 
 def join_continuations(text: str) -> str:
@@ -114,7 +120,21 @@ def _check_permissions(raw: str) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    expected = argv[1].lstrip("v") if len(argv) > 1 else None
+    expected: str | None = None
+    if len(argv) > 1:
+        tag = argv[1].strip()
+        # Only this exact token skips the gate. An empty argument is a broken
+        # caller, and treating it as "no tag" would silently publish a version
+        # nothing ever checked.
+        if not tag:
+            print(
+                f"manifest: empty tag argument; pass {NO_TAG_GATE} to skip the "
+                "version gate deliberately",
+                file=sys.stderr,
+            )
+            return 1
+        expected = None if tag == NO_TAG_GATE else tag.lstrip("v")
+
     labels = load()
     problems = check(labels, expected)
 
@@ -123,8 +143,9 @@ def main(argv: list[str]) -> int:
             print(f"manifest: {problem}", file=sys.stderr)
         return 1
 
+    gate = f"matches tag {expected}" if expected else "no tag to check against"
     print(f"manifest OK: version {labels['version']}, "
-          f"{len(labels)} labels, all JSON labels parse")
+          f"{len(labels)} labels, all JSON labels parse, {gate}")
     return 0
 
 

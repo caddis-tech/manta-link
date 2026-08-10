@@ -148,3 +148,17 @@ def test_cli_accepts_a_v_prefixed_tag():
 
 def test_cli_rejects_a_mismatched_tag():
     assert manifest.main(["manifest.py", "v99.0.0"]) == 1
+
+
+def test_cli_skips_the_version_gate_on_a_manual_dispatch():
+    assert manifest.main(["manifest.py", manifest.NO_TAG_GATE]) == 0
+
+
+def test_cli_still_gates_a_tag_push_while_the_skip_token_exists():
+    assert manifest.main(["manifest.py", manifest.NO_TAG_GATE]) == 0
+    assert manifest.main(["manifest.py", "v99.0.0"]) == 1
+
+
+def test_cli_refuses_an_empty_tag_rather_than_skipping_the_gate(capsys):
+    assert manifest.main(["manifest.py", ""]) == 1
+    assert manifest.NO_TAG_GATE in capsys.readouterr().err

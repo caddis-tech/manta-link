@@ -51,8 +51,14 @@ jobs:
       # serial access, and that the version LABEL agrees with the tag being
       # released. Kraken refuses an unparseable manifest silently, so this is the
       # only place that failure is cheap to find.
+      #
+      # On a manual dispatch there is no tag, so ref_name is the branch and the
+      # version could never agree with it. Pass the skip token instead, spelled
+      # exactly as tools/manifest.py defines it: an empty argument is refused
+      # there rather than treated as a skip, so a broken expression here fails
+      # the release instead of publishing an unchecked version.
       - name: Validate the BlueOS manifest against the release tag
-        run: python tools/manifest.py "${{ github.ref_name }}"
+        run: python tools/manifest.py "${{ github.ref_type == 'tag' && github.ref_name || '--no-tag' }}"
 
   publish:
     needs: [test, manifest]
