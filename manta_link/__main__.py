@@ -79,7 +79,7 @@ def open_or_carry_on(name: str, opener: Callable[[], None]) -> None:
 
 
 def main() -> int:
-    logging_setup.configure()
+    sink = logging_setup.configure()
     install_signal_handlers()
     log.info("MANTA Link %s starting", __version__)
 
@@ -104,7 +104,11 @@ def main() -> int:
         supervisor.run_forever("reader", reader.run_forever, health.note_restart)
     except SystemExit:
         log.info("stopped after answering %d request(s)", reader.answered_count)
-        return 0
+    finally:
+        # The drain is a daemon and QueueHandler.flush is a no-op, so nothing
+        # else empties the queue: without this the line above dies with us, and
+        # a clean stop is indistinguishable from a SIGKILL in the docker log.
+        sink.stop()
     return 0
 
 

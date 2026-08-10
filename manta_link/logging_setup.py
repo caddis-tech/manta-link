@@ -15,6 +15,7 @@ the reader stops reading the port. The remedy has to be in-process, and this is
 it: the shared lock is now held only long enough to put an object on a queue.
 """
 
+import atexit
 import logging
 import logging.handlers
 import queue
@@ -31,6 +32,10 @@ FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 LOG_QUEUE_MAX = 2048
 
 DROP_REPORT_INTERVAL_S = 60.0
+
+# Long enough to write a full queue to a pipe that is draining, short enough to
+# stay well inside the stop timeout Kraken gives us when the pipe is not.
+DRAIN_STOP_TIMEOUT_S = 2.0
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +76,7 @@ class DroppingQueueHandler(logging.handlers.QueueHandler):
     keep off the reader.
     """
 
-    def __init__(self, log_queue: "queue.Queue[logging.LogRecord]") -> None:
+    def __init__(self, log_queue: "queue.Queue[logging.LogRecord | None]") -> None:
         super().__init__(log_queue)
         self.dropped = 0
 
@@ -89,7 +94,7 @@ class LogSink:
 
     def __init__(
         self,
-        log_queue: "queue.Queue[logging.LogRecord]",
+        log_queue: "queue.Queue[logging.LogRecord | None]",
         target: logging.Handler,
         source: DroppingQueueHandler,
     ) -> None:
@@ -98,6 +103,7 @@ class LogSink:
         self._source = source
         self._reported_drops = 0
         self._drop_report = Throttle(DROP_REPORT_INTERVAL_S)
+        self._stopping = threading.Event()
         self.thread: threading.Thread | None = None
 
     @property
@@ -119,9 +125,30 @@ class LogSink:
         )
         self.thread.start()
 
+    def stop(self, timeout_s: float = DRAIN_STOP_TIMEOUT_S) -> bool:
+        """Write what is queued, then end the thread. Returns whether it ended.
+
+        Bounded, because the drain may be blocked on a stalled pipe, and an
+        unbounded wait there is the stop timeout and SIGKILL we exist to avoid.
+        """
+        thread = self.thread
+        if thread is None:
+            return True
+        self._stopping.set()
+        try:
+            # Wakes an idle drain out of its blocking get. If there is no room
+            # for the sentinel the loop sees the flag once it has caught up.
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        thread.join(timeout_s)
+        return not thread.is_alive()
+
     def _drain_forever(self) -> None:
         while True:
             record = self._queue.get()
+            if record is None:
+                return
             try:
                 self._target.handle(record)
             except Exception:
@@ -130,6 +157,8 @@ class LogSink:
                 # because the alternative is a process that logs nothing again.
                 pass
             self._report_drops()
+            if self._stopping.is_set() and self._queue.empty():
+                return
 
     def _report_drops(self) -> None:
         """Say that lines were lost, so silence is never mistaken for calm."""
@@ -140,7 +169,11 @@ class LogSink:
         # keeps its place in the ordering of the lines around it.
         log.warning("dropped %d log line(s) to keep the reader unblocked",
                     dropped - self._reported_drops)
-        self._reported_drops = dropped
+        if self._source.dropped == dropped:
+            # We report through the queue that is full by definition here, so
+            # the warning can be dropped itself. Leaving the watermark where it
+            # was keeps the whole count outstanding for the next attempt.
+            self._reported_drops = dropped
 
 
 def configure(
@@ -157,7 +190,12 @@ def configure(
     target = logging.StreamHandler(stream if stream is not None else sys.stdout)
     target.setFormatter(logging.Formatter(FORMAT))
 
-    log_queue: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=queue_max)
+    # logging.shutdown's atexit pass acquires every handler's lock, and the drain
+    # holds the target's for the whole of a blocked write, so a stalled pipe hangs
+    # the exit itself with no timeout. LogSink.stop is the bounded replacement.
+    atexit.unregister(logging.shutdown)
+
+    log_queue: queue.Queue[logging.LogRecord | None] = queue.Queue(maxsize=queue_max)
     source = DroppingQueueHandler(log_queue)
 
     root = logging.getLogger()
