@@ -130,6 +130,7 @@ class Spool:
         self._lock = threading.Lock()
         self._index: deque[str] = deque()
         self._next_sequence = 0
+        self._ready = False
         self._write_log = Throttle(WRITE_LOG_INTERVAL_S)
         self._evict_log = Throttle(EVICT_LOG_INTERVAL_S)
 
@@ -166,6 +167,7 @@ class Spool:
             self._index = deque(names)
             self._next_sequence = _sequence_after(names)
             self._evict_over_cap()
+        self._ready = True
         if names:
             log.info("recovered %d spooled record(s) from %s",
                      len(names), self._directory)
@@ -177,6 +179,13 @@ class Spool:
         capture worker and everything slow on that thread eventually shows up as
         a backlog in front of the reader.
         """
+        if not self._ready:
+            # The caller keeps running through a failed open(), but the sequence
+            # is still at zero there, so writing would replace stored entries
+            # one per cycle instead of merely losing the new one.
+            self._counters.bump("spool_unopened_drops")
+            return None
+
         with self._lock:
             name = f"{self._next_sequence:0{NAME_WIDTH}d}{ENTRY_SUFFIX}"
             self._next_sequence += 1
@@ -196,10 +205,12 @@ class Spool:
             return list(self._index)
 
     def load(self, name: str) -> dict[str, Any] | None:
-        """One entry, or None if it is gone or unreadable.
+        """One entry, or None if it is gone, unreadable, or unparseable.
 
-        An unreadable entry is discarded rather than retried forever: it is a
-        truncated or corrupted file, and no number of reads will improve it.
+        Only unparseable content is discarded rather than retried forever: it is
+        a truncated or corrupted file, and no number of reads will improve it. A
+        read that fails on I/O says nothing about the content, so that entry is
+        left for a later pass.
         """
         try:
             with open(self._directory / name, "rb") as handle:
@@ -207,7 +218,15 @@ class Spool:
         except FileNotFoundError:
             self._forget(name)
             return None
-        except (OSError, ValueError) as exc:
+        except OSError as exc:
+            # EMFILE, EIO and ESTALE leave the file intact, and unlink needs no
+            # descriptor, so discarding here would succeed exactly where the
+            # read failed and take the whole spool an entry per uploader pass.
+            self._counters.bump("spool_read_errors")
+            log.warning("could not read spool entry %s (%s); leaving it for a "
+                        "later pass", name, exc)
+            return None
+        except ValueError as exc:
             self._counters.bump("spool_discarded")
             log.warning("discarding unreadable spool entry %s (%s)", name, exc)
             self.remove(name)

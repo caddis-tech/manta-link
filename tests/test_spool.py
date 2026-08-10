@@ -126,6 +126,29 @@ class TestPutAndDrain:
         assert store.load(name) is None
         assert counters.get("spool_discarded") == 1
         assert store.names() == []
+        assert not (store.directory / name).exists()
+
+    def test_a_read_that_fails_on_io_leaves_the_entry_where_it_is(
+        self, monkeypatch, store, counters, caplog
+    ):
+        """Descriptor exhaustion in the uploader loop says nothing about the
+        content, and unlink needs no descriptor: discarding here would empty the
+        whole spool an entry per pass, every one of them logged as corruption."""
+        name = store.put(envelope(1))
+
+        def too_many_open_files(*_args, **_kwargs):
+            raise OSError(24, "Too many open files")
+
+        monkeypatch.setattr(spool, "open", too_many_open_files, raising=False)
+        with caplog.at_level("WARNING"):
+            assert store.load(name) is None
+        monkeypatch.undo()
+
+        assert (store.directory / name).exists()
+        assert store.names() == [name]
+        assert counters.get("spool_discarded") == 0
+        assert counters.get("spool_read_errors") == 1
+        assert "discarding" not in caplog.text
 
     def test_a_write_that_cannot_happen_is_counted_not_raised(self, store, counters):
         """Nothing in this process may end over a failed write. A record lost is
@@ -158,6 +181,34 @@ class TestPutAndDrain:
         store.put(envelope(1))
         on_disk = sorted(entry.name for entry in os.scandir(store.directory))
         assert on_disk == store.names()
+
+
+class TestAFailedOpen:
+    def test_a_spool_that_never_opened_writes_nothing(
+        self, monkeypatch, tmp_path, counters
+    ):
+        """The caller logs a failed open and carries on, which is the documented
+        tradeoff for losing new records. It is not a licence to destroy stored
+        ones: the sequence is still at zero, so a write lands on the name the
+        oldest fsynced entry already has."""
+        directory = tmp_path / "spool"
+        first = Spool(directory, counters, max_entries=10)
+        first.open()
+        stored = first.put(envelope(1))
+
+        def unreadable_directory(_path):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(os, "scandir", unreadable_directory)
+        broken = Spool(directory, counters, max_entries=10)
+        with pytest.raises(OSError):
+            broken.open()
+        monkeypatch.undo()
+
+        assert broken.put(envelope(2)) is None
+        assert counters.get("spool_unopened_drops") == 1
+        assert json.loads((directory / stored).read_text()) == envelope(1)
+        assert sorted(entry.name for entry in os.scandir(directory)) == [stored]
 
 
 class TestEviction:
