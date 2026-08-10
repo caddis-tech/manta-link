@@ -6,6 +6,7 @@ a signal is delivered to. It is also the only context guaranteed to be running,
 which is why the health worker's own liveness is checked from inside its loop.
 """
 
+import argparse
 import logging
 import os
 import signal
@@ -78,7 +79,28 @@ def open_or_carry_on(name: str, opener: Callable[[], None]) -> None:
                       "it is counted and lost until it can be", name)
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> None:
+    """Refuse anything that is not a bare start, before the port is touched.
+
+    There are no options; configuration is environment only. Without a parser an
+    unrecognised flag was ignored and startup continued, so `--help` seized the
+    Pico's port on a live boat instead of printing usage.
+    """
+    parser = argparse.ArgumentParser(
+        prog="manta_link",
+        description="Own the Pico's serial port, answer its time request, and "
+                    "make every reading durable.",
+        epilog=f"Configuration is environment only: {VOLUME_ENV} (default "
+               f"{DEFAULT_VOLUME}), and {DATA_DEVICE_ENV} (unset leaves the "
+               f"archive off).",
+    )
+    parser.add_argument("--version", action="version",
+                        version=f"MANTA Link {__version__}")
+    parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parse_args(argv)
     sink = logging_setup.configure()
     install_signal_handlers()
     log.info("MANTA Link %s starting", __version__)
