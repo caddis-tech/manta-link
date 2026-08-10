@@ -32,6 +32,7 @@ from .golden import READING, SATURATED_READING
 # The golden line's own values, so a test says what it means rather than
 # repeating a literal that has to be kept in step with the file.
 UPTIME_MS = 72_000
+FIRMWARE_VERSION = "2.1.0+ecdd3dc"
 PICO_EPOCH_MS = 1_754_400_072_000
 BOOT_EPOCH_MS = PICO_EPOCH_MS - UPTIME_MS
 
@@ -42,6 +43,15 @@ PI_EPOCH_MS = 1_754_500_000_000
 # boundary says which side it is on.
 RUN_A = "e0a1c5be-0000-4000-8000-00000000000a"
 RUN_B = "e0a1c5be-0000-4000-8000-00000000000b"
+
+# The Pico's startup record, in the field order record_json_boot() offers them.
+# Kept here rather than in tests/data because nothing in this package reads a
+# boot line's values: what is under test is that it is dropped, not what is in it.
+BOOT_LINE = (
+    b'{"type":"boot","firmware_version":"2.1.0+ecdd3dc","sd_logging":1,'
+    b'"ph_status":"?STATUS,P,5.038","cond_status":"?STATUS,B,4.992",'
+    b'"temp_probes":1,"uv_probe":"present","boot_epoch_ms":1754400000000}'
+)
 
 
 @pytest.fixture
@@ -118,6 +128,7 @@ class TestFieldMapping:
         """
         assert record.to_payload(reading()) == {
             "type": "reading",
+            "firmware_version": FIRMWARE_VERSION,
             "time": "0:01:12",
             "epoch_ms": PICO_EPOCH_MS,
             "sd_ready": 1,
@@ -130,6 +141,7 @@ class TestFieldMapping:
             "ph": 7.234,
             "temp_code": "0x1a2b",
             "water_temperature": 18.4,
+            "uv_present": True,
             "uv_counts": 812,
             "uv_mv": 654,
             "uv_index": 5,
@@ -226,6 +238,26 @@ class TestMappingRot:
         invisible to every consumer, with nothing anywhere to say so.
         """
         assert record.unknown_keys(json.loads(READING)) == []
+
+    def test_the_keys_every_live_firmware_emits_are_known(self):
+        """firmware_version and uv_present both predate the firmware commit that
+        made serial a sink at all, so no build that can feed this process omits
+        them. Counting them saturates the detector from the first record, which
+        is how the next field addition would arrive invisible."""
+        emitted_by_every_build = {
+            "firmware_version": FIRMWARE_VERSION,
+            "uv_present": True,
+            "truncated": True,
+        }
+        assert record.unknown_keys(emitted_by_every_build) == []
+
+    def test_the_golden_line_bumps_nothing(self, counters):
+        calls: list[str] = []
+        recorder = Recorder(RecordingSpool(calls), RecordingArchive(calls), counters)
+
+        recorder.capture(READING, reading(), time.monotonic())
+
+        assert counters.get("payload_keys_unknown") == 0
 
     def test_a_new_key_is_named_rather_than_passed_through_quietly(self):
         assert record.unknown_keys(reading(ms_since_boot=72_123)) == ["ms_since_boot"]
@@ -701,6 +733,67 @@ class TestRecorder:
         recorder = Recorder(RecordingSpool(calls), RecordingArchive(calls), counters)
         recorder.capture(READING, reading(), time.monotonic())
         assert counters.get("timestamps_from_pico") == 1
+
+
+class TestBootRecords:
+    """The startup line is a record, not a reading. framing.classify() calls
+    anything opening with a brace a RECORD, and nothing below it looked again."""
+
+    def test_a_boot_record_is_neither_archived_nor_spooled(self, counters):
+        """Processed as a reading it becomes an envelope of five manufactured
+        null sensor keys, and one that can never be stamped: with no uptime, no
+        anchor reaches it, so it holds a spool slot until the ring evicts it."""
+        calls: list[str] = []
+        spool = RecordingSpool(calls)
+        archive = RecordingArchive(calls)
+        recorder = Recorder(spool, archive, counters)
+
+        recorder.capture(BOOT_LINE, json.loads(BOOT_LINE), time.monotonic())
+
+        assert calls == []
+        assert spool.entries == []
+        assert archive.lines == []
+        assert counters.get("boot_records") == 1
+
+    def test_its_fields_are_not_counted_as_unknown_reading_fields(
+        self, counters, caplog
+    ):
+        calls: list[str] = []
+        recorder = Recorder(RecordingSpool(calls), RecordingArchive(calls), counters)
+
+        with caplog.at_level("WARNING"):
+            recorder.capture(BOOT_LINE, json.loads(BOOT_LINE), time.monotonic())
+
+        assert counters.get("payload_keys_unknown") == 0
+        assert caplog.text == ""
+
+    def test_every_key_the_boot_line_carries_is_one_this_mapping_knows(self):
+        """The reading line's tripwire, for the other kind of record."""
+        assert record.unknown_keys(json.loads(BOOT_LINE)) == []
+
+    def test_a_new_boot_field_is_still_named(self):
+        parsed = json.loads(BOOT_LINE)
+        parsed["uv_pad_mv"] = 12
+        assert record.unknown_keys(parsed) == ["uv_pad_mv"]
+
+    def test_it_does_not_report_as_a_reading_that_lost_its_timestamp(self, counters):
+        calls: list[str] = []
+        recorder = Recorder(RecordingSpool(calls), RecordingArchive(calls), counters)
+
+        recorder.capture(BOOT_LINE, json.loads(BOOT_LINE), time.monotonic())
+
+        assert counters.get("timestamps_absent") == 0
+
+    def test_the_boot_epoch_is_not_taken_as_an_anchor(self, counters, unsynced_clock):
+        """Held for a later cycle deliberately. Anchoring on boot_epoch_ms moves
+        the timestamp on every later reading in the run, and the API stores those
+        with no correction path."""
+        calls: list[str] = []
+        recorder = Recorder(RecordingSpool(calls), RecordingArchive(calls), counters)
+
+        recorder.capture(BOOT_LINE, json.loads(BOOT_LINE), time.monotonic())
+
+        assert recorder.anchor.value is None
 
 
 class TestUptime:

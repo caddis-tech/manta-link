@@ -59,12 +59,18 @@ DISAGREEMENT_TOLERANCE_MS = 10_000
 ANCHOR_LOG_INTERVAL_S = 60.0
 MAPPING_LOG_INTERVAL_S = 60.0
 
-# Every key the Pico is known to emit. A key outside this set still reaches the
-# payload, but it is counted and named in the log, because an unrecognised key
-# is the shape a new firmware field arrives in and the mapping below is the only
-# thing standing between one and a column nobody can read.
+KIND_BOOT = "boot"
+
+# Every key a reading is known to carry. A key outside this set still reaches
+# the payload, but it is counted and named in the log, because an unrecognised
+# key is the shape a new firmware field arrives in and the mapping below is the
+# only thing standing between one and a column nobody can read.
+#
+# `truncated` is not a measurement: the firmware appends it when a field did not
+# fit the record buffer, so it can turn up on either kind of record.
 PICO_KEYS = frozenset({
     "type",
+    "firmware_version",
     "time",
     "epoch_ms",
     "boot_epoch_ms",
@@ -75,10 +81,28 @@ PICO_KEYS = frozenset({
     "ph",
     "temp_code",
     "temperature",
+    "uv_present",
     "uv_counts",
     "uv_mv",
     "uv_index",
     "uv_saturated",
+    "truncated",
+})
+
+# The startup record's own fields, which are almost none of a reading's. Measured
+# against PICO_KEYS it reports six perfectly ordinary boot fields as unknown, and
+# a detector that fires on every run is one nobody reads by the time a genuinely
+# new field arrives.
+BOOT_KEYS = frozenset({
+    "type",
+    "firmware_version",
+    "sd_logging",
+    "ph_status",
+    "cond_status",
+    "temp_probes",
+    "uv_probe",
+    "boot_epoch_ms",
+    "truncated",
 })
 
 # Keys that must not survive into the payload under their own name.
@@ -139,8 +163,9 @@ def to_payload(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def unknown_keys(record: dict[str, Any]) -> list[str]:
-    """Keys this mapping has never been told about."""
-    return sorted(set(record) - PICO_KEYS)
+    """Keys this mapping has never been told about, for the kind of record it is."""
+    known = BOOT_KEYS if record.get("type") == KIND_BOOT else PICO_KEYS
+    return sorted(set(record) - known)
 
 
 def uptime_ms_from(record: dict[str, Any]) -> int | None:
@@ -418,6 +443,10 @@ class Recorder:
 
     def capture(self, raw: bytes, record: dict[str, Any], received: float) -> None:
         """One parsed record, on the capture thread. Never the reader's."""
+        if record.get("type") == KIND_BOOT:
+            self._capture_boot()
+            return
+
         uptime_ms = uptime_ms_from(record)
         pico_ms = pico_epoch_ms(record)
         anchor_ms = self.anchor.for_record(uptime_ms, pico_ms, received)
@@ -436,6 +465,16 @@ class Recorder:
         # a boat with no token is exactly when a local copy matters most.
         self._archive.append(envelope)
         self._spool.put(envelope)
+
+    def _capture_boot(self) -> None:
+        """The startup line carries no measurement, so nothing durable comes of it.
+
+        Spooling one would hold a ring slot to no purpose: it has no uptime, so
+        no anchor could ever stamp it drainable. boot_epoch_ms is left unread on
+        purpose; anchoring on it moves the stamp on every later reading in the
+        run, and the API is create-only with no way to correct one.
+        """
+        self._counters.bump("boot_records")
 
     def _count_stamp(self, stamp: Stamp) -> None:
         if stamp.source == SOURCE_PICO:

@@ -6,11 +6,15 @@ and break those tests loudly, which is the only way a silent read-layer
 mismatch ever becomes visible.
 
 Both lines came out of the firmware's own record_json_reading()
-(AquadronePicoFirmware quentin, cda532a), not off a boat and not typed here. The
-hand-written literal they replace disagreed with that writer in four places at
-once: an uppercase hex temp_code, a fractional uv_index, an integer
-uv_saturated and a one-decimal temperature are none of them shapes the firmware
-can emit, and no test in the suite could see the difference.
+(AquadronePicoFirmware ecdd3dc, branch fix/d1-both-sinks), not off a boat and
+not typed here. The hand-written literal they replace disagreed with that writer
+in four places at once: an uppercase hex temp_code, a fractional uv_index, an
+integer uv_saturated and a one-decimal temperature are none of them shapes the
+firmware can emit, and no test in the suite could see the difference.
+
+firmware_version's value is whatever a given build stamped in, so nothing should
+assert on it beyond its shape. That every record carries one is the part that
+matters: it, and uv_present, predate every firmware that can feed this process.
 """
 
 from pathlib import Path
