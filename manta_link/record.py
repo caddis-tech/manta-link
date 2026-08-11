@@ -17,13 +17,18 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, TypeGuard
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from . import clock
 from .archive import Archive
 from .health import Counters
 from .logging_setup import Throttle
 from .spool import Spool
+
+if TYPE_CHECKING:
+    # Types only. gps knows nothing about caddis-api's key names and this owns
+    # them, so the import stays one-way and stays out of the runtime graph.
+    from .gps import Position, PositionCache
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +60,26 @@ UPTIME_JUMP_MAX_MS = 3_600_000
 # expected. Past this the two clocks are telling different stories, and the
 # difference is reported rather than corrected: the Pico's value stands.
 DISAGREEMENT_TOLERANCE_MS = 10_000
+
+# How old a fix may be and still describe where a reading was taken. At the
+# cycle above, a boat under way at 2 m/s has moved sixty metres in this time,
+# which is wider than any pond boundary is drawn to. It is a reasoned bound
+# rather than a measured one, and the alternative is no bound at all.
+POSITION_MAX_AGE_S = 30.0
+
+# The only position keys that go on the wire. caddis-api reads gps_latitude and
+# gps_longitude; the other four ride in the payload blob so the evidence for a
+# coordinate travels with it, and so the data exists the day a reader is added.
+# The vehicle tags stay in the archive and off the wire: nothing can read them
+# and this link is metered.
+PAYLOAD_POSITION_KEYS = frozenset({
+    "gps_latitude",
+    "gps_longitude",
+    "gps_age_s",
+    "gps_fix_type",
+    "gps_satellites",
+    "gps_hdop",
+})
 
 ANCHOR_LOG_INTERVAL_S = 60.0
 MAPPING_LOG_INTERVAL_S = 60.0
@@ -242,14 +267,64 @@ def resolve_stamp(
     return Stamp(None, None, uptime_ms)
 
 
+def position_payload_fields(
+    position: "Position | None", received: float
+) -> dict[str, Any]:
+    """Where the boat was when this record was read, in the API's key names.
+
+    The age is worked out here, against this record's own receipt time, rather
+    than taken from the poller. That is the difference between a stale position
+    being visible and being invisible: a poller wedged in a socket read stays
+    alive so the watchdog never restarts it, and the capture worker can be
+    draining a record buffered eleven minutes ago. Both cases publish a fix
+    whose own timestamp is old, and only a per-record age notices.
+
+    Nothing at all is returned rather than a set of nulls, because the wire is a
+    metered cellular link and an absent key and a null key mean the same thing
+    to every reader caddis-api has.
+    """
+    if position is None or position.fix_at is None:
+        return {}
+
+    # How far apart the two are, in either direction. Signed is not enough: a
+    # fix ten minutes NEWER than the record is the backlog case, where the
+    # capture worker drains a record buffered eleven minutes ago and the cache
+    # answers with where the boat is now. A boat moves the same distance in ten
+    # minutes whichever side of the reading the fix falls on.
+    separation_s = abs(received - position.fix_at)
+    if separation_s > POSITION_MAX_AGE_S:
+        return {}
+
+    return {
+        "gps_latitude": position.latitude,
+        "gps_longitude": position.longitude,
+        # The magnitude, so it is never negative. In the ordinary case the fix
+        # is the older of the two and this is exactly its age.
+        "gps_age_s": round(separation_s, 3),
+        "gps_fix_type": position.fix_type,
+        "gps_satellites": position.satellites,
+        "gps_hdop": position.hdop,
+    }
+
+
 def build_envelope(
     raw_line: bytes,
     record: dict[str, Any],
     stamp: Stamp,
     run_id: str,
-    position: dict[str, Any] | None = None,
+    position: "Position | None" = None,
+    received: float | None = None,
 ) -> dict[str, Any]:
-    """The line as it is spooled, archived, and eventually POSTed."""
+    """The line as it is spooled, archived, and eventually POSTed.
+
+    `received` is the monotonic the reader stamped this line with, and is
+    required whenever a position is given: it is what the fix's age is measured
+    against.
+    """
+    payload = to_payload(record)
+    if position is not None and received is not None:
+        payload |= position_payload_fields(position, received)
+
     return {
         "client_ref": client_ref_for(raw_line),
         "timestamp_ms": stamp.timestamp_ms,
@@ -262,10 +337,12 @@ def build_envelope(
         # restart of this process loses every in-memory way of telling two of
         # them apart.
         "run_id": run_id,
-        # Step 4 fills this, and it is the archive's whole reason for existing:
-        # the Pico's card holds every other field on this line and not this one.
-        "position": position,
-        "payload": to_payload(record),
+        # The archive's whole reason for existing: the Pico's card holds every
+        # other field on this line and not this one. Kept in its structured
+        # form, which carries what the payload deliberately leaves off the wire,
+        # including a coordinate the fix gate refused to promote.
+        "position": None if position is None else position.as_envelope(),
+        "payload": payload,
     }
 
 
@@ -508,11 +585,17 @@ class Recorder:
         archive: Archive,
         counters: Counters,
         anchor: Anchor | None = None,
+        position: "PositionCache | None" = None,
     ) -> None:
         self._spool = spool
         self._archive = archive
         self._counters = counters
         self.anchor = anchor if anchor is not None else Anchor(counters)
+        # Read, never called into. One attribute load of a frozen object, so
+        # nothing slow or failable joins the capture thread: proxying
+        # MAVLink2Rest per record would couple the boat's sample rate to that
+        # service's latency.
+        self._position = position
         self._mapping_log = Throttle(MAPPING_LOG_INTERVAL_S)
         self._disagreement_log = Throttle(MAPPING_LOG_INTERVAL_S)
 
@@ -530,9 +613,14 @@ class Recorder:
         stamp = resolve_stamp(record, uptime_ms, anchor_ms)
         self._count_stamp(stamp)
 
+        position = None if self._position is None else self._position.latest
+
         # The run id is read after for_record, which is what rotates it: a
         # record arriving on the far side of a reset belongs to the new run.
-        envelope = build_envelope(raw, record, stamp, self.anchor.run_id)
+        envelope = build_envelope(
+            raw, record, stamp, self.anchor.run_id, position, received
+        )
+        self._count_position(envelope["payload"])
         self._report_mapping_losses(record, envelope["payload"])
 
         # Archive first. A spool write that fails still leaves the position on
@@ -550,6 +638,18 @@ class Recorder:
         run, and the API is create-only with no way to correct one.
         """
         self._counters.bump("boot_records")
+
+    def _count_position(self, payload: dict[str, Any]) -> None:
+        """Whether this reading will resolve to a waterway, tallied per record.
+
+        The heartbeat's gps_* counters say what the poller saw. This says what
+        actually reached a payload, which is a different number whenever a fix
+        is fresh enough to hold and too old to use.
+        """
+        if "gps_latitude" in payload:
+            self._counters.bump("records_with_position")
+        else:
+            self._counters.bump("records_without_position")
 
     def _count_stamp(self, stamp: Stamp) -> None:
         if stamp.source == SOURCE_PICO:

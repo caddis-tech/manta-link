@@ -4,6 +4,12 @@ The reader stays on the main thread deliberately. A worker dying, or failing to
 start at all, cannot take the port owner with it, and the main thread is the one
 a signal is delivered to. It is also the only context guaranteed to be running,
 which is why the health worker's own liveness is checked from inside its loop.
+
+Every worker is registered before `Health.start()`. `_restart_dead_workers`
+iterates the worker dict on health's own thread with no lock, so registering one
+afterwards raises "dictionary changed size during iteration" and takes the
+watchdog down with it. `Health.register` still allows it, for the case it was
+written for; nothing here uses that.
 """
 
 import argparse
@@ -15,7 +21,17 @@ from collections.abc import Callable
 from pathlib import Path
 from types import FrameType
 
-from . import __version__, archive, capture, logging_setup, record, spool, supervisor
+from . import (
+    __version__,
+    archive,
+    capture,
+    gps,
+    logging_setup,
+    mavlink2rest,
+    record,
+    spool,
+    supervisor,
+)
 from .health import Counters, Health
 from .reader import SerialReader
 
@@ -30,12 +46,17 @@ DEFAULT_VOLUME = "/app/data"
 # first. Unset is the shipping default and leaves the archive off.
 DATA_DEVICE_ENV = "AQUADRONE_DATA_DEVICE"
 
+# Where the autopilot's position comes from. The default is the loopback address
+# MAVLink2Rest answers on under host networking; a bench run points it at a rig.
+MAVLINK2REST_URL_ENV = "AQUADRONE_MAVLINK2REST_URL"
+
 # Every variable that configures this process, and what leaving it unset means.
 # --help is built from this and the test suite reads the same tuple, so a knob
 # added without a line here fails rather than shipping undocumented.
 CONFIG_ENV_HELP: tuple[tuple[str, str], ...] = (
     (VOLUME_ENV, f"the persistent volume, default {DEFAULT_VOLUME}"),
     (DATA_DEVICE_ENV, "the removable device; unset leaves the archive off"),
+    (MAVLINK2REST_URL_ENV, f"MAVLink2Rest, default {mavlink2rest.DEFAULT_URL}"),
 )
 
 CONFIG_ENV_NAMES: tuple[str, ...] = tuple(name for name, _ in CONFIG_ENV_HELP)
@@ -58,7 +79,9 @@ def install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _on_terminate)
 
 
-def build_recorder(counters: Counters) -> record.Recorder:
+def build_recorder(
+    counters: Counters, positions: "gps.PositionCache | None" = None
+) -> record.Recorder:
     """The durable half: where a reading is put, and what it is put as.
 
     Nothing here is allowed to end the process. A spool that cannot be opened
@@ -75,7 +98,29 @@ def build_recorder(counters: Counters) -> record.Recorder:
 
     open_or_carry_on("spool", store.open)
     open_or_carry_on("archive", ring.open)
-    return record.Recorder(store, ring, counters)
+    return record.Recorder(store, ring, counters, position=positions)
+
+
+def register_gps(
+    health: Health, positions: "gps.PositionCache", counters: Counters
+) -> None:
+    """Start the position poller, or say why readings will carry none.
+
+    A URL this cannot dial is a configuration mistake, not a reason to stop. The
+    port owner is the job that cannot be given up, and a boat with no positions
+    still records water quality onto its card and into the spool.
+    """
+    url = os.environ.get(MAVLINK2REST_URL_ENV, mavlink2rest.DEFAULT_URL)
+    try:
+        link = mavlink2rest.Mavlink2Rest(url)
+    except mavlink2rest.BadUrl as exc:
+        counters.bump("gps_disabled")
+        log.error("%s is unusable (%s); readings will carry no position",
+                  MAVLINK2REST_URL_ENV, exc)
+        return
+
+    log.info("polling MAVLink2Rest at %s for position", link.url)
+    health.register("gps", gps.GpsPoller(link, positions, counters).run_forever)
 
 
 def open_or_carry_on(name: str, opener: Callable[[], None]) -> None:
@@ -118,11 +163,13 @@ def main(argv: list[str] | None = None) -> int:
     counters = Counters()
     records = capture.new_record_buffer()
     logs = capture.new_log_buffer()
-    recorder = build_recorder(counters)
+    positions = gps.PositionCache()
+    recorder = build_recorder(counters, positions)
 
     worker = capture.CaptureWorker(records, logs, counters, sink=recorder.capture)
     health = Health(counters)
     health.register("capture", worker.run_forever)
+    register_gps(health, positions, counters)
     health.start()
 
     reader = SerialReader(

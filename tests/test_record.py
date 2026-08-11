@@ -16,6 +16,7 @@ import pytest
 
 from manta_link import clock, record
 from manta_link import reader as reader_mod
+from manta_link.gps import Position, PositionCache, Tags
 from manta_link.health import Counters
 from manta_link.reader import SerialReader
 from manta_link.record import (
@@ -84,6 +85,27 @@ def reading(**overrides) -> dict:
     parsed = json.loads(READING)
     parsed.update(overrides)
     return parsed
+
+
+def a_fix(at: float, **overrides) -> Position:
+    """A usable 3D fix, taken at the monotonic instant given."""
+    fields = {
+        "published_at": at,
+        "fix_at": at,
+        "latitude": 39.9350992,
+        "longitude": -82.9968149,
+        "fix_type": "GPS_FIX_TYPE_3D_FIX",
+        "satellites": 12,
+        "hdop": 1.45,
+    }
+    return Position(**(fields | overrides))
+
+
+class OnePosition:
+    """A cache holding one snapshot, standing in for the live poller."""
+
+    def __init__(self, position: "Position | None") -> None:
+        self.latest = position
 
 
 def unstamped_line(sample_ms: int) -> bytes:
@@ -345,9 +367,185 @@ class TestClientRef:
             reading(),
             Stamp(PICO_EPOCH_MS, SOURCE_PICO, UPTIME_MS),
             RUN_B,
-            position={"lat": 44.1, "lon": -70.2},
+            position=a_fix(at=500.0),
+            received=500.0,
         )
         assert live["client_ref"] == backfilled["client_ref"]
+        # The two really do differ in the envelope, or this proves nothing.
+        assert live["position"] != backfilled["position"]
+
+
+class TestPositionReachesThePayload:
+    def test_a_current_fix_arrives_as_the_keys_caddis_api_reads(self):
+        envelope = record.build_envelope(
+            READING,
+            reading(),
+            Stamp(PICO_EPOCH_MS, SOURCE_PICO, UPTIME_MS),
+            RUN_A,
+            position=a_fix(at=500.0),
+            received=502.0,
+        )
+
+        payload = envelope["payload"]
+        assert payload["gps_latitude"] == pytest.approx(39.9350992)
+        assert payload["gps_longitude"] == pytest.approx(-82.9968149)
+        assert payload["gps_age_s"] == pytest.approx(2.0)
+        assert payload["gps_fix_type"] == "GPS_FIX_TYPE_3D_FIX"
+        assert payload["gps_satellites"] == 12
+        assert payload["gps_hdop"] == 1.45
+
+    def test_the_structured_form_is_kept_beside_the_flat_keys(self):
+        """The archive is the only copy of a refused coordinate and of the
+        vehicle tags, neither of which goes on the wire."""
+        position = a_fix(
+            at=500.0,
+            refused_latitude=44.1,
+            refused_fix_type="GPS_FIX_TYPE_2D_FIX",
+            tags=Tags(armed=True, vehicle_type="MAV_TYPE_SURFACE_BOAT"),
+            tags_at=500.0,
+        )
+
+        envelope = record.build_envelope(
+            READING, reading(), Stamp(None, None, UPTIME_MS), RUN_A, position, 500.0
+        )
+
+        assert envelope["position"]["refused_latitude"] == 44.1
+        assert envelope["position"]["mav_armed"] is True
+        assert "mav_armed" not in envelope["payload"]
+        assert "refused_latitude" not in envelope["payload"]
+
+    def test_a_record_buffered_for_ten_minutes_is_not_given_the_position_now(self):
+        """The whole reason the age is derived here and not by the poller.
+
+        The record buffer holds 256 entries, roughly eleven minutes, and the
+        capture worker can be draining one that was read long before the fix now
+        sitting in the cache. A producer-computed age, or a signed one, reports
+        that as a fresh coordinate: the fix is NEWER than the record, so the
+        difference is negative and slips under any "too old" test.
+        """
+        envelope = record.build_envelope(
+            READING,
+            reading(),
+            Stamp(PICO_EPOCH_MS, SOURCE_PICO, UPTIME_MS),
+            RUN_A,
+            position=a_fix(at=1_100.0),
+            received=500.0,
+        )
+
+        assert "gps_latitude" not in envelope["payload"]
+
+    def test_a_snapshot_from_a_poller_that_stopped_publishing_ages_out(self):
+        # A poller wedged in a socket read stays is_alive(), so the watchdog
+        # never restarts it and the cache keeps answering with the last fix.
+        fields = record.position_payload_fields(
+            a_fix(at=100.0), received=100.0 + record.POSITION_MAX_AGE_S + 0.001
+        )
+
+        assert fields == {}
+
+    def test_a_fix_exactly_at_the_limit_is_still_used(self):
+        fields = record.position_payload_fields(
+            a_fix(at=100.0), received=100.0 + record.POSITION_MAX_AGE_S
+        )
+
+        assert fields["gps_latitude"] is not None
+
+    def test_a_fix_taken_just_after_the_record_was_read_is_still_used(self):
+        # Two threads stamping from one monotonic, so a fix landing a moment
+        # after the record was read is ordinary interleaving, not an error.
+        fields = record.position_payload_fields(a_fix(at=500.5), received=500.0)
+
+        assert fields["gps_latitude"] is not None
+        assert fields["gps_age_s"] == 0.5
+
+    def test_the_reported_age_is_never_negative(self):
+        fields = record.position_payload_fields(a_fix(at=510.0), received=500.0)
+
+        assert fields["gps_age_s"] == 10.0
+
+    def test_a_poller_that_has_never_had_a_fix_adds_nothing(self):
+        never = Position(published_at=500.0)
+
+        assert record.position_payload_fields(never, received=500.0) == {}
+
+    def test_no_poller_at_all_adds_nothing(self):
+        assert record.position_payload_fields(None, received=500.0) == {}
+
+    def test_the_coordinate_keys_are_absent_rather_than_null(self):
+        """An absent key and a null key read the same to caddis-api, and this
+        link is metered."""
+        envelope = record.build_envelope(
+            READING,
+            reading(),
+            Stamp(PICO_EPOCH_MS, SOURCE_PICO, UPTIME_MS),
+            RUN_A,
+            position=Position(published_at=500.0),
+            received=500.0,
+        )
+
+        for key in record.PAYLOAD_POSITION_KEYS:
+            assert key not in envelope["payload"]
+
+    def test_nothing_but_the_named_keys_reaches_the_payload(self):
+        fields = record.position_payload_fields(a_fix(at=500.0), received=500.0)
+
+        assert set(fields) == record.PAYLOAD_POSITION_KEYS
+
+    def test_a_record_captured_with_no_poller_is_spooled_as_it_was_before(
+        self, counters
+    ):
+        calls: list[str] = []
+        spool = RecordingSpool(calls)
+        recorder = Recorder(spool, RecordingArchive(calls), counters)
+
+        recorder.capture(READING, reading(), time.monotonic())
+
+        assert spool.entries[0]["position"] is None
+        assert "gps_latitude" not in spool.entries[0]["payload"]
+
+    def test_the_recorder_reads_the_cache_rather_than_calling_anything(
+        self, counters
+    ):
+        calls: list[str] = []
+        spool = RecordingSpool(calls)
+        cache = OnePosition(a_fix(at=time.monotonic()))
+        recorder = Recorder(
+            spool, RecordingArchive(calls), counters, position=cache
+        )
+
+        recorder.capture(READING, reading(), time.monotonic())
+
+        assert spool.entries[0]["payload"]["gps_latitude"] is not None
+        assert counters.get("records_with_position") == 1
+
+    def test_a_reading_with_no_usable_fix_is_counted_separately(self, counters):
+        calls: list[str] = []
+        recorder = Recorder(
+            RecordingSpool(calls),
+            RecordingArchive(calls),
+            counters,
+            position=OnePosition(Position(published_at=time.monotonic())),
+        )
+
+        recorder.capture(READING, reading(), time.monotonic())
+
+        assert counters.get("records_without_position") == 1
+        assert counters.get("records_with_position") == 0
+
+    def test_the_live_cache_starts_empty_and_costs_the_recorder_nothing(
+        self, counters
+    ):
+        calls: list[str] = []
+        recorder = Recorder(
+            RecordingSpool(calls),
+            RecordingArchive(calls),
+            counters,
+            position=PositionCache(),
+        )
+
+        recorder.capture(READING, reading(), time.monotonic())
+
+        assert counters.get("records_without_position") == 1
 
 
 class TestTimestampPrecedence:
