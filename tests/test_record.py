@@ -49,9 +49,16 @@ RUN_B = "e0a1c5be-0000-4000-8000-00000000000b"
 # The Pico's startup record, in the field order record_json_boot() offers them.
 # Kept here rather than in tests/data because nothing in this package reads a
 # boot line's values: what is under test is that it is dropped, not what is in it.
+#
+# The parsed halves beside each raw ?STATUS string arrived with the firmware's
+# Atlas work (AquadronePicoFirmware#35). Their values are what
+# atlas_parse_status makes of the two raw strings above them: a restart code
+# passed through as sent, and the supply held in millivolts so the logging path
+# needs no float.
 BOOT_LINE = (
     b'{"type":"boot","firmware_version":"2.1.0+ecdd3dc","sd_logging":1,'
-    b'"ph_status":"?STATUS,P,5.038","cond_status":"?STATUS,B,4.992",'
+    b'"ph_status":"?STATUS,P,5.038","ph_restart":"P","ph_supply_mv":5038,'
+    b'"cond_status":"?STATUS,B,4.992","cond_restart":"B","cond_supply_mv":4992,'
     b'"temp_probes":1,"uv_probe":"present","boot_epoch_ms":1754400000000}'
 )
 
@@ -269,7 +276,10 @@ class TestMappingRot:
         assert counters.get("payload_keys_unknown") == 0
 
     def test_a_new_key_is_named_rather_than_passed_through_quietly(self):
-        assert record.unknown_keys(reading(ms_since_boot=72_123)) == ["ms_since_boot"]
+        # Deliberately a field no filed firmware issue proposes. ms_since_boot
+        # was the example until PICO_KEYS learned it, at which point this test
+        # asserted the opposite of what it says.
+        assert record.unknown_keys(reading(chlorophyll=1.4)) == ["chlorophyll"]
 
     def test_an_unknown_key_is_counted_and_logged(self, counters, caplog):
         calls: list[str] = []
@@ -932,6 +942,30 @@ class TestUptime:
     )
     def test_anything_else_is_no_uptime_at_all(self, value):
         assert record.uptime_ms_from({"time": value}) is None
+
+    def test_the_raw_value_is_preferred_over_the_string(self):
+        # The string is second-truncated at the source, so it cannot express the
+        # 723 ms this record actually carries.
+        both = {"time": "1:02:03", "ms_since_boot": 3_723_723}
+        assert record.uptime_ms_from(both) == 3_723_723
+
+    def test_the_string_is_still_read_when_the_firmware_sends_no_raw_value(self):
+        assert record.uptime_ms_from({"time": "1:02:03"}) == 3_723_000
+
+    def test_a_zero_raw_uptime_is_read_rather_than_falling_through(self):
+        # The first record of a run can legitimately be at zero, and zero is
+        # falsy: a truthiness check here would silently prefer the string.
+        assert record.uptime_ms_from({"time": "0:00:00", "ms_since_boot": 0}) == 0
+
+    @pytest.mark.parametrize("raw", [True, False, "3723723", 3723.7, -1, None, []])
+    def test_a_raw_value_of_the_wrong_shape_falls_back_to_the_string(self, raw):
+        # bool is the one that matters: it subclasses int, so an unguarded
+        # isinstance reads True as one millisecond into the run.
+        both = {"time": "1:02:03", "ms_since_boot": raw}
+        assert record.uptime_ms_from(both) == 3_723_000
+
+    def test_a_raw_value_with_no_string_beside_it_is_still_read(self):
+        assert record.uptime_ms_from({"ms_since_boot": 3_723_723}) == 3_723_723
 
 
 class _NoSleep:

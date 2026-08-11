@@ -44,16 +44,16 @@ DEVICE_NAMESPACE = uuid.UUID("72908e53-703b-510b-9c7b-8e51084912e2")
 # skews an entire deployment in the same direction.
 EMIT_LAG_MS = 2000
 
-# Uptime is second-truncated, so consecutive records at the 2.5s cycle always
-# rise. Anything that does not rise is a reset. Anything this far ahead is not
-# the run we anchored to: buffer drops and stalled workers cost minutes, not
-# hours. Both are false-positive tolerant, because a drop only costs a
-# re-derivation from the very next record.
+# Consecutive records at the 2.5s cycle always rise, so anything that does not
+# is a reset. Anything this far ahead is not the run we anchored to: buffer
+# drops and stalled workers cost minutes, not hours. Both are false-positive
+# tolerant, because a drop only costs a re-derivation from the very next record.
 UPTIME_JUMP_MAX_MS = 3_600_000
 
-# Second-truncated uptime plus the emit-lag estimate makes a few seconds of
-# disagreement expected. Past this the two clocks are telling different stories,
-# and the difference is reported rather than corrected: the Pico's value stands.
+# On a firmware with no raw ms_since_boot the uptime is second-truncated, which
+# together with the emit-lag estimate makes a few seconds of disagreement
+# expected. Past this the two clocks are telling different stories, and the
+# difference is reported rather than corrected: the Pico's value stands.
 DISAGREEMENT_TOLERANCE_MS = 10_000
 
 ANCHOR_LOG_INTERVAL_S = 60.0
@@ -72,6 +72,7 @@ PICO_KEYS = frozenset({
     "type",
     "firmware_version",
     "time",
+    "ms_since_boot",
     "epoch_ms",
     "boot_epoch_ms",
     "sd_ready",
@@ -98,7 +99,11 @@ BOOT_KEYS = frozenset({
     "firmware_version",
     "sd_logging",
     "ph_status",
+    "ph_restart",
+    "ph_supply_mv",
     "cond_status",
+    "cond_restart",
+    "cond_supply_mv",
     "temp_probes",
     "uv_probe",
     "boot_epoch_ms",
@@ -189,12 +194,21 @@ def unknown_keys(record: dict[str, Any]) -> list[str]:
 
 
 def uptime_ms_from(record: dict[str, Any]) -> int | None:
-    """Milliseconds since the Pico booted, from the h:mm:ss it prints.
+    """Milliseconds since the Pico booted.
 
-    Second-truncated at the source, which is why two records from either side of
-    a fast reset can carry the same value. AquadronePicoFirmware#28 adds a raw
-    ms_since_boot; this should prefer it once it exists.
+    Prefers the raw value (AquadronePicoFirmware#28) and falls back to parsing
+    the h:mm:ss string, which is all a firmware without it carries. The string
+    is second-truncated at the source, which is why two records from either side
+    of a fast reset can carry the same value and why the raw one matters.
+
+    A raw value of the wrong type or an impossible sign falls back rather than
+    being refused outright: the string is derived independently on the device,
+    so it is still worth reading when the number is not.
     """
+    raw = record.get("ms_since_boot")
+    if _is_plain_int(raw) and raw >= 0:
+        return raw
+
     text = record.get("time")
     if not isinstance(text, str):
         return None
@@ -413,9 +427,17 @@ class Anchor:
             return
 
         step_ms = uptime_ms - self._last_uptime_ms
-        # Not "strictly lower". Uptime is second-truncated on a deterministic
-        # boot sequence, so a reset after exactly one record reproduces the
-        # value we already saw, and equal is not lower.
+        # Not "strictly lower". On a firmware with no raw ms_since_boot the
+        # uptime is second-truncated on a deterministic boot sequence, so a
+        # reset after exactly one record reproduces the value we already saw,
+        # and equal is not lower.
+        #
+        # The raw value removes this detector rather than making it unreachable:
+        # the same reset then reads as a small forward step, which is
+        # indistinguishable from an ordinary cycle. Deliberately not replaced
+        # with a floor on the step size, because a cadence change (#44) produces
+        # exactly that shape. The reconnect notice is the primary detector and
+        # after #28 it is the only one.
         if 0 < step_ms <= UPTIME_JUMP_MAX_MS:
             return
 
