@@ -62,6 +62,8 @@ firmware rejects both and only says so on one side.
 | `framing.py` | Bytes to lines, lines to kinds. Pure, no I/O |
 | `clock.py` | Whether this Pi's clock is worth sending, and what it reads |
 | `portfinder.py` | Finding the Pico among the boat's USB serial devices |
+| `mavlink2rest.py` | One HTTP GET, and the shapes MAVLink2Rest wraps a value in |
+| `gps.py` | Whether a fix is worth believing, and caching the last one that was |
 | `capture.py` | Draining the reader's buffers and parsing, on its own thread |
 | `record.py` | The envelope, the timestamp policy, and the field mapping |
 | `spool.py` | The durable queue the upload drains, and where it lives |
@@ -124,6 +126,34 @@ before is counted and named in the log rather than passed through in silence.
 resolves to the same row: the live upload, a retry after a lost acknowledgement,
 the archive stick and the Pico's own card.
 
+## Where the boat was
+
+The Pico has no GPS, so every `gps_latitude` that reaches caddis-api comes from
+`gps.py` polling MAVLink2Rest. A record gets `gps_latitude`, `gps_longitude`,
+`gps_age_s`, `gps_fix_type`, `gps_satellites` and `gps_hdop`, or it gets none of
+them: an absent key and a null key read the same to every consumer, and the link
+is metered. **caddis-api has a reader property for the first two only.** The
+other four ride in the payload blob and are invisible until one is added, which
+is the same gap `uv_index` has.
+
+Two staleness questions are answered in two places, because they fail
+differently. *Is the autopilot still talking?* Only `status.time.counter` moves;
+MAVLink2Rest serves the last message it received forever, so a 200 says the
+service is up and nothing else. That is `gps.py`. *Is this snapshot current?*
+The poller publishes the instant a fix was accepted, never an age, and
+`record.py` measures it against the moment each record was received. A poller
+wedged in a socket read stays alive so the watchdog never restarts it, and the
+capture worker can be draining a record buffered eleven minutes ago; only a
+per-record age notices either.
+
+A fix has to be 3D or better. 2D is refused because the only consumer is a
+strict ray-cast containment with no low-confidence channel, so a 2D fix under
+poor geometry files a sample in the neighbouring pond, permanently. The refused
+coordinate is still written to the archive, because refusing to *file* it is
+defensible and refusing to *record* it is a one-way loss. A position of exactly
+(0, 0) is discarded outright: ArduPilot publishes it until the EKF has an
+origin, and caddis-api ray-casts it like any other point.
+
 The spool lives in a subdirectory of the extension volume, never the volume
 itself, because `.env` holds the API token and the startup index scan must never
 enumerate the directory holding it. One scan at startup builds an in-memory
@@ -149,7 +179,7 @@ BlueOS web UI, Extensions, **Installed** tab, the **+** button, then:
 | Extension Identifier | `caddis.manta-link` |
 | Extension Name | `MANTA Link` |
 | Docker image | `ghcr.io/caddis-tech/manta-link` |
-| Docker tag | a pinned version such as `0.4.0` |
+| Docker tag | a pinned version such as `0.5.0` |
 | Custom settings | leave empty; the image's own `permissions` label is used |
 
 Pin the tag rather than using `latest`, so the Extensions Manager shows which
@@ -239,7 +269,7 @@ Tag it. CI runs the tests and validates the manifest against the tag before
 anything is pushed.
 
 ```bash
-git tag v0.4.0
+git tag v0.5.0
 git push --tags
 ```
 
