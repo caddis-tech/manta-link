@@ -30,6 +30,16 @@ DEFAULT_VOLUME = "/app/data"
 # first. Unset is the shipping default and leaves the archive off.
 DATA_DEVICE_ENV = "AQUADRONE_DATA_DEVICE"
 
+# Every variable that configures this process, and what leaving it unset means.
+# --help is built from this and the test suite reads the same tuple, so a knob
+# added without a line here fails rather than shipping undocumented.
+CONFIG_ENV_HELP: tuple[tuple[str, str], ...] = (
+    (VOLUME_ENV, f"the persistent volume, default {DEFAULT_VOLUME}"),
+    (DATA_DEVICE_ENV, "the removable device; unset leaves the archive off"),
+)
+
+CONFIG_ENV_NAMES: tuple[str, ...] = tuple(name for name, _ in CONFIG_ENV_HELP)
+
 
 def _on_terminate(signum: int, frame: FrameType | None) -> None:
     log.info("signal %d received; shutting down", signum)
@@ -90,9 +100,9 @@ def parse_args(argv: list[str] | None = None) -> None:
         prog="manta_link",
         description="Own the Pico's serial port, answer its time request, and "
                     "make every reading durable.",
-        epilog=f"Configuration is environment only: {VOLUME_ENV} (default "
-               f"{DEFAULT_VOLUME}), and {DATA_DEVICE_ENV} (unset leaves the "
-               f"archive off).",
+        epilog="Configuration is environment only: "
+               + "; ".join(f"{name} is {what}" for name, what in CONFIG_ENV_HELP)
+               + ".",
     )
     parser.add_argument("--version", action="version",
                         version=f"MANTA Link {__version__}")

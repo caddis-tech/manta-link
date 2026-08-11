@@ -17,15 +17,16 @@ class TestArgumentsThatShouldNotStartTheDaemon:
         assert exit_info.value.code == 0
         assert "usage: manta_link" in capsys.readouterr().out
 
-    def test_help_names_the_environment_variables_that_configure_this(self, capsys):
+    @pytest.mark.parametrize("name", __main__.CONFIG_ENV_NAMES)
+    def test_help_names_every_configuration_variable(self, capsys, name):
         # There are no flags, so help is worthless unless it says where the
-        # settings actually live.
+        # settings actually live. Parametrized over the tuple --help is built
+        # from, so a new knob is covered the moment it exists rather than
+        # whenever someone remembers to extend a hardcoded pair.
         with pytest.raises(SystemExit):
             __main__.parse_args(["--help"])
 
-        printed = capsys.readouterr().out
-        assert __main__.VOLUME_ENV in printed
-        assert __main__.DATA_DEVICE_ENV in printed
+        assert name in capsys.readouterr().out
 
     def test_version_reports_the_package_version(self, capsys):
         with pytest.raises(SystemExit) as exit_info:

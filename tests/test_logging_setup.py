@@ -111,13 +111,19 @@ class SlowStream(CollectingStream):
 
 
 def stub_out_the_hardware(monkeypatch, run_forever) -> None:
-    """Leave main's logging and shutdown path real, and nothing else."""
+    """Leave main's logging and shutdown path real, and nothing else.
+
+    Both stubs take *_, **__ rather than the exact signature they replace. A
+    stub pinned to today's parameters turns every later argument into a
+    TypeError raised from this file, which reports a signature change as a
+    logging failure in the one suite whose subject is neither.
+    """
     monkeypatch.setattr(__main__, "install_signal_handlers", lambda: None)
     monkeypatch.setattr(
         __main__,
         "build_recorder",
-        lambda counters: SimpleNamespace(
-            capture=lambda *_: None,
+        lambda *_, **__: SimpleNamespace(
+            capture=lambda *_, **__: None,
             anchor=SimpleNamespace(
                 note_serial_reconnect=lambda: None, note_banner=lambda: None
             ),
@@ -126,11 +132,11 @@ def stub_out_the_hardware(monkeypatch, run_forever) -> None:
     monkeypatch.setattr(
         __main__,
         "Health",
-        lambda counters: SimpleNamespace(
-            register=lambda *_: None,
+        lambda *_, **__: SimpleNamespace(
+            register=lambda *_, **__: None,
             start=lambda: None,
             check_from_main_thread=lambda: None,
-            note_restart=lambda *_: None,
+            note_restart=lambda *_, **__: None,
         ),
     )
     monkeypatch.setattr(__main__.supervisor, "run_forever", run_forever)

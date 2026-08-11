@@ -1,0 +1,16 @@
+# The build context is the whole repo, so everything here is uploaded to the
+# buildx builder before the first instruction runs. `COPY manta_link/` is narrow
+# enough that none of it reaches the image, but a bench .env holding a live API
+# token should never leave this machine in the first place, and a .venv is
+# hundreds of megabytes across the wire for nothing.
+.env
+.env.*
+.venv/
+.git/
+tests/
+tools/
+*.egg-info/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

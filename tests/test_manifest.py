@@ -6,6 +6,7 @@ malformed LABEL an expensive thing to discover.
 
 import json
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,21 @@ def labels():
     return manifest.load()
 
 
+def dockerignore_patterns() -> list[str]:
+    """The real patterns, with comments and blank lines dropped.
+
+    Parsed rather than substring-matched because the file's own comment explains
+    why the token must not reach the builder, and so contains the very string a
+    naive check would look for.
+    """
+    text = (manifest.DOCKERFILE.parent / ".dockerignore").read_text(encoding="utf-8")
+    return [
+        stripped
+        for line in text.splitlines()
+        if (stripped := line.strip()) and not stripped.startswith("#")
+    ]
+
+
 class TestRealDockerfile:
     def test_manifest_has_no_problems(self, labels):
         assert manifest.check(labels) == []
@@ -28,6 +44,16 @@ class TestRealDockerfile:
         from manta_link import __version__
 
         assert labels["version"] == __version__
+
+    def test_version_matches_pyproject(self, labels):
+        # The other two copies are both pinned: this test covers the package,
+        # and tools/manifest.py compares the LABEL to the git tag on a release.
+        # pyproject is the copy nothing reads, so it can drift to a wrong
+        # version and every gate including the release still passes.
+        pyproject = tomllib.loads(
+            (manifest.DOCKERFILE.parent / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        assert pyproject["project"]["version"] == labels["version"]
 
     @pytest.mark.parametrize("key", manifest.JSON_LABELS)
     def test_json_labels_parse(self, labels, key):
@@ -71,6 +97,16 @@ class TestRealDockerfile:
     def test_unbuffered_output(self):
         text = manifest.DOCKERFILE.read_text(encoding="utf-8")
         assert "PYTHONUNBUFFERED=1" in text
+
+    def test_the_build_context_excludes_the_env_file(self):
+        # Everything in the context is uploaded to the builder before the first
+        # instruction runs, and a bench run leaves a real token in a .env beside
+        # this Dockerfile. COPY is narrow enough that it never reaches the
+        # image; this keeps it off the builder as well.
+        assert ".env" in dockerignore_patterns()
+
+    def test_the_build_context_excludes_the_virtualenv(self):
+        assert ".venv/" in dockerignore_patterns()
 
 
 class TestParser:
