@@ -1,0 +1,37 @@
+{
+  "message": {
+    "alt": {
+      "type": "int32_t",
+      "value": 253250
+    },
+    "hdg": {
+      "type": "uint16_t",
+      "value": 18258
+    },
+    "lat": {
+      "type": "int32_t",
+      "value": 399350992
+    },
+    "lon": {
+      "type": "int32_t",
+      "value": -829968149
+    },
+    "relative_alt": {
+      "type": "int32_t",
+      "value": -49
+    },
+    "time_boot_ms": {
+      "type": "uint32_t",
+      "value": 2157109
+    },
+    "type": "GLOBAL_POSITION_INT"
+  },
+  "status": {
+    "time": {
+      "counter": 2156,
+      "first_update": "2026-08-11T12:39:35.231186182Z",
+      "frequency": 1.001393437385559,
+      "last_update": "2026-08-11T13:15:29.199621391Z"
+    }
+  }
+}

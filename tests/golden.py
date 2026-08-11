@@ -1,4 +1,7 @@
-"""The Pico lines every test measures against.
+"""The captured reference data every test measures against.
+
+Two sources, kept in one place: the Pico lines below, and the MAVLink2Rest
+bodies at the bottom.
 
 One copy, in a file, rather than a literal repeated per suite. The mapping tests
 assert an exact payload against it, so a firmware change should move this file
@@ -28,3 +31,39 @@ READING = (DATA / "pico_reading.json").read_bytes().strip()
 # only shape in the record where a mapped field is a JSON boolean and another is
 # an explicit null, which is what makes it worth keeping a second file for.
 SATURATED_READING = (DATA / "pico_reading_uv_saturated.json").read_bytes().strip()
+
+
+# --- MAVLink2Rest ------------------------------------------------------------
+#
+# The response shape is the one thing in this project not usefully guessed at,
+# so which of these came off a real autopilot and which were written by hand is
+# recorded per file rather than left to be assumed.
+#
+# Captured from the bench rig's Navigator on 2026-08-11, verbatim including the
+# status block mavlink2rest wraps every message in:
+#
+#   mavlink_global_position_int.json   a real 3D fix, bare integer coordinates
+#   mavlink_gps_raw_int_3d.json        the same instant: 3D fix, 12 satellites
+#   mavlink_heartbeat.json             ArduRover, MAV_TYPE_SURFACE_BOAT
+#   mavlink_vfr_hud.json               groundspeed, and nothing else we read
+#
+# Written by hand, because the rig had a good fix throughout and none of these
+# could be captured without breaking it:
+#
+#   mavlink_gps_raw_int_no_fix.json    GPS_FIX_TYPE_NO_FIX, 0 satellites, eph
+#                                      65535, which is how a cold start reads
+#   mavlink_global_position_int_null_island.json
+#                                      lat and lon exactly 0, which ArduPilot
+#                                      publishes until the EKF has an origin
+#   mavlink_*_wrapped.json             the older {"type", "value"} scalar
+#                                      wrapping, kept because a mavlink2rest
+#                                      that does it is still in the fleet
+#
+# The hand-written four are modelled on the captured four and carry the same key
+# set. That is the part worth distrusting: they prove the parsing, not what an
+# autopilot does over time.
+
+
+def mavlink(name: str) -> bytes:
+    """One captured MAVLink2Rest response body, exactly as it came off the wire."""
+    return (DATA / f"mavlink_{name}.json").read_bytes()
