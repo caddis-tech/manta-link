@@ -25,6 +25,7 @@ from . import (
     __version__,
     archive,
     capture,
+    config,
     gps,
     logging_setup,
     mavlink2rest,
@@ -57,6 +58,9 @@ CONFIG_ENV_HELP: tuple[tuple[str, str], ...] = (
     (VOLUME_ENV, f"the persistent volume, default {DEFAULT_VOLUME}"),
     (DATA_DEVICE_ENV, "the removable device; unset leaves the archive off"),
     (MAVLINK2REST_URL_ENV, f"MAVLink2Rest, default {mavlink2rest.DEFAULT_URL}"),
+    (config.TOKEN_ENV, f"the API token; also read from ${VOLUME_ENV}/"
+                       f"{config.ENV_FILENAME}, which wins"),
+    (config.API_URL_ENV, f"the API, default {config.DEFAULT_API_URL}"),
 )
 
 CONFIG_ENV_NAMES: tuple[str, ...] = tuple(name for name, _ in CONFIG_ENV_HELP)
@@ -79,6 +83,11 @@ def install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, _on_terminate)
 
 
+def data_volume() -> Path:
+    """The persistent volume. The token's .env lives here, the spool below it."""
+    return Path(os.environ.get(VOLUME_ENV, DEFAULT_VOLUME))
+
+
 def build_recorder(
     counters: Counters, positions: "gps.PositionCache | None" = None
 ) -> record.Recorder:
@@ -90,9 +99,8 @@ def build_recorder(
     prevent.
     """
     device = spool.find_data_device(os.environ.get(DATA_DEVICE_ENV))
-    volume = Path(os.environ.get(VOLUME_ENV, DEFAULT_VOLUME))
 
-    directory, max_entries = spool.choose_directory(device, volume)
+    directory, max_entries = spool.choose_directory(device, data_volume())
     store = spool.Spool(directory, counters, max_entries)
     ring = archive.Archive(archive.choose_directory(device), counters)
 
@@ -166,8 +174,17 @@ def main(argv: list[str] | None = None) -> int:
     positions = gps.PositionCache()
     recorder = build_recorder(counters, positions)
 
+    tokens = config.TokenSession()
+    watcher = config.ConfigWatcher(data_volume(), tokens)
+    # Read once here rather than waiting for the first beat. Health credits
+    # itself a full interval at start, so a boat provisioned through Kraken's
+    # Env would otherwise sit unconfigured for a minute after every install.
+    # This is the main thread, which becomes the reader thread below; no reload
+    # runs on it once the port is open.
+    watcher.reload()
+
     worker = capture.CaptureWorker(records, logs, counters, sink=recorder.capture)
-    health = Health(counters)
+    health = Health(counters, on_beat=watcher.reload)
     health.register("capture", worker.run_forever)
     register_gps(health, positions, counters)
     health.start()

@@ -7,10 +7,23 @@ name = "manta-link"
 version = "0.5.0"
 description = "The single Pi-side process that owns the Aquadrone Pico's serial port"
 requires-python = ">=3.11"
-dependencies = ["pyserial==3.5"]
+# Pinned exactly, including requests' own closure. The image is built for
+# linux/arm/v7 through QEMU, and a resolver that picks a different wheel there
+# than it picked here is a difference nobody sees until a boat will not start
+# over a cellular link. Every name here must also appear in the Dockerfile's pip
+# line; tests/test_manifest.py checks that, because CI installs this file and
+# never runs the image.
+dependencies = [
+    "pyserial==3.5",
+    "requests==2.34.2",
+    "certifi==2026.7.22",
+    "charset-normalizer==3.4.9",
+    "idna==3.18",
+    "urllib3==2.7.0",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mypy>=1.11", "types-requests"]
 
 [tool.setuptools]
 packages = ["manta_link"]
