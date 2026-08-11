@@ -7,6 +7,7 @@ anchor stamps a run with times that look entirely reasonable. None of the three
 raises anything anywhere, which is why they are tested this heavily.
 """
 
+import itertools
 import json
 import time
 import uuid
@@ -22,6 +23,7 @@ from manta_link.record import (
     SOURCE_ANCHOR,
     SOURCE_PICO,
     Anchor,
+    AnchorState,
     Recorder,
     Stamp,
 )
@@ -164,13 +166,20 @@ class TestFieldMapping:
         assert payload["water_temperature"] == 18.4
         assert "temperature" not in payload
 
-    def test_battery_level_is_never_emitted(self):
-        """The API's property turns an explicit null into a zero.
+    def test_a_battery_reading_is_passed_through_rather_than_stripped(self):
+        """This used to be stripped, and the reason has since been fixed.
 
-        A boat reporting a flat battery it does not have is worse than one
-        reporting no battery at all (caddis-api#77).
+        The API's property turned an explicit null into a zero, and a boat
+        reporting a flat battery it does not have is worse than one reporting no
+        battery at all. caddis-api#77 fixed that property, so stripping now only
+        means discarding a real measurement in silence if the firmware ever
+        starts sending one. No firmware does today, which is what makes this the
+        cheap moment to stop.
         """
-        assert "battery_level" not in record.to_payload(reading(battery_level=None))
+        assert record.to_payload(reading(battery_level=87.5))["battery_level"] == 87.5
+
+    def test_an_explicit_null_battery_stays_null_rather_than_reading_as_flat(self):
+        assert record.to_payload(reading(battery_level=None))["battery_level"] is None
 
     def test_ph_as_a_string_becomes_a_number(self):
         assert record.to_payload(reading(ph="7.234"))["ph"] == 7.234
@@ -387,7 +396,7 @@ class TestDrainability:
             READING, reading(epoch_ms=None), Stamp(None, None, UPTIME_MS), RUN_A
         )
 
-        stamped = record.stamp_with_anchor(spooled, BOOT_EPOCH_MS, RUN_A)
+        stamped = record.stamp_with_anchor(spooled, AnchorState(BOOT_EPOCH_MS, RUN_A))
 
         assert record.is_drainable(stamped)
         assert stamped["timestamp_ms"] == PICO_EPOCH_MS
@@ -401,13 +410,13 @@ class TestDrainability:
         spooled = record.build_envelope(
             READING, reading(), Stamp(PICO_EPOCH_MS, SOURCE_PICO, UPTIME_MS), RUN_A
         )
-        assert record.stamp_with_anchor(spooled, 1, RUN_A) is spooled
+        assert record.stamp_with_anchor(spooled, AnchorState(1, RUN_A)) is spooled
 
     def test_an_entry_with_no_uptime_can_never_be_stamped(self):
         envelope = record.build_envelope(
             READING, reading(epoch_ms=None, time="junk"), Stamp(None, None, None), RUN_A
         )
-        stamped = record.stamp_with_anchor(envelope, BOOT_EPOCH_MS, RUN_A)
+        stamped = record.stamp_with_anchor(envelope, AnchorState(BOOT_EPOCH_MS, RUN_A))
         assert not record.is_drainable(stamped)
 
     def test_an_anchor_from_a_later_run_leaves_an_older_entry_alone(self):
@@ -423,7 +432,9 @@ class TestDrainability:
             READING, reading(epoch_ms=None), Stamp(None, None, UPTIME_MS), RUN_A
         )
 
-        stamped = record.stamp_with_anchor(spooled, BOOT_EPOCH_MS + 86_400_000, RUN_B)
+        stamped = record.stamp_with_anchor(
+            spooled, AnchorState(BOOT_EPOCH_MS + 86_400_000, RUN_B)
+        )
 
         assert stamped is spooled
         assert not record.is_drainable(stamped)
@@ -433,7 +444,123 @@ class TestDrainability:
         only honest answer is the give-up rule: it stays spooled and the Pico's
         card is the copy that survives."""
         older = {"client_ref": "x", "timestamp_ms": None, "uptime_ms": UPTIME_MS}
-        assert record.stamp_with_anchor(older, BOOT_EPOCH_MS, RUN_A) is older
+        state = AnchorState(BOOT_EPOCH_MS, RUN_A)
+        assert record.stamp_with_anchor(older, state) is older
+
+    def test_an_anchor_that_has_been_dropped_stamps_nothing(self):
+        spooled = record.build_envelope(
+            READING, reading(epoch_ms=None), Stamp(None, None, UPTIME_MS), RUN_A
+        )
+        assert record.stamp_with_anchor(spooled, AnchorState(None, RUN_A)) is spooled
+
+    @pytest.mark.parametrize("stamp", ["1754400072000", True, 1.5, [], {}])
+    def test_a_timestamp_of_the_wrong_type_is_not_drainable(self, stamp):
+        # The spool promises a dict and nothing about what is in it, so a
+        # corrupted entry can carry the right key with the wrong type. Under a
+        # null check every one of these drains, and a string reaches the
+        # uploader's arithmetic.
+        assert not record.is_drainable({"timestamp_ms": stamp})
+
+    def test_a_corrupt_stamp_is_left_alone_rather_than_quietly_replaced(self):
+        # This fills gaps, and a mistyped value is not a gap. Overwriting it
+        # would turn corruption into a plausible number nothing could question.
+        corrupt = {
+            "timestamp_ms": "1754400072000",
+            "uptime_ms": UPTIME_MS,
+            "run_id": RUN_A,
+        }
+        stamped = record.stamp_with_anchor(corrupt, AnchorState(BOOT_EPOCH_MS, RUN_A))
+        assert stamped is corrupt
+
+
+class RecordingAnchor(Anchor):
+    """An Anchor that remembers every pair it ever published.
+
+    Racing a real thread against this cannot test it: the window between two
+    adjacent stores is a few nanoseconds and the interpreter only switches
+    threads every few milliseconds, so a racing test passes against the torn
+    implementation almost every time. Reading the sequence of published values
+    settles the same question with no timing in it at all.
+    """
+
+    def __init__(self, counters) -> None:
+        self.published: list[AnchorState] = []
+        super().__init__(counters)
+
+    def __setattr__(self, name: str, value) -> None:
+        super().__setattr__(name, value)
+        if name == "_state":
+            self.published.append(value)
+
+
+class TestTheAnchorPairIsPublishedWhole:
+    """The epoch and the run it belongs to are never separately true."""
+
+    def test_a_new_run_identity_is_never_published_carrying_the_old_runs_epoch(
+        self, counters, unsynced_clock
+    ):
+        """Dropping an anchor rotates the run identity and clears the epoch.
+
+        Written as a store to each half, the pair is briefly readable as the new
+        run's id beside the old run's epoch, and stamp_with_anchor cannot catch
+        that because the tear is in the input its own run gate compares. Stamped
+        from it, a whole spool shifts by the gap between two boots: plausible,
+        drainable, and permanent against a create-only API. The uploader becomes
+        that reader in step 5.
+        """
+        anchor = RecordingAnchor(counters)
+
+        uptime = UPTIME_MS
+        for _ in range(3):
+            uptime += 2_500
+            anchor.for_record(uptime, BOOT_EPOCH_MS + uptime, time.monotonic())
+            anchor.note_serial_reconnect()
+            uptime += 2_500
+            anchor.for_record(uptime, None, time.monotonic())
+
+        minted_with_an_epoch = [
+            after
+            for before, after in itertools.pairwise(anchor.published)
+            if after.run_id != before.run_id and after.value is not None
+        ]
+        assert minted_with_an_epoch == []
+
+    def test_the_probe_can_see_a_torn_publication(self, counters):
+        """The test above is only worth having if this one is possible.
+
+        Asserts the recorder observes intermediate states rather than only the
+        settled one, so a two-store drop would be caught rather than smoothed
+        over by reading the attribute after the fact.
+        """
+        anchor = RecordingAnchor(counters)
+        anchor._state = AnchorState(BOOT_EPOCH_MS, RUN_A)
+        anchor._state = AnchorState(None, RUN_B)
+
+        assert anchor.published[-2:] == [
+            AnchorState(BOOT_EPOCH_MS, RUN_A),
+            AnchorState(None, RUN_B),
+        ]
+
+    def test_the_reconnect_notice_still_drops_the_anchor_after_the_rebind(
+        self, counters, unsynced_clock
+    ):
+        """_pending_drop stays a plain attribute rather than joining the state.
+
+        The reader thread writes it and the capture thread writes the state, so
+        folding it in would make note_serial_reconnect a read-modify-write of a
+        shared object, and a notice lost that way leaves a stale anchor stamping
+        the next run.
+        """
+        anchor = Anchor(counters)
+        anchor.for_record(UPTIME_MS, PICO_EPOCH_MS, time.monotonic())
+        first = anchor.state
+        assert first.value == BOOT_EPOCH_MS
+
+        anchor.note_serial_reconnect()
+        anchor.for_record(UPTIME_MS + 2_500, None, time.monotonic())
+
+        assert anchor.state.value is None
+        assert anchor.state.run_id != first.run_id
 
 
 class TestAnchorDerivation:

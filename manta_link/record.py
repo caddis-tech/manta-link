@@ -17,7 +17,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeGuard
 
 from . import clock
 from .archive import Archive
@@ -107,10 +107,14 @@ BOOT_KEYS = frozenset({
 
 # Keys that must not survive into the payload under their own name.
 # `temperature` becomes `water_temperature`, which is the property the API
-# actually reads. `battery_level` is never emitted at all: the API's property
-# turns an explicit null into a zero (caddis-api#77), and a boat reporting a
-# flat battery it does not have is worse than one reporting nothing.
-REPLACED_KEYS = frozenset({"temperature", "battery_level"})
+# actually reads.
+#
+# `battery_level` used to be stripped here too, because the API's property
+# turned an explicit null into a zero and a boat reporting a flat battery it
+# does not have is worse than one reporting nothing. caddis-api#77 fixed that
+# property, so stripping now only means a battery reading would be discarded in
+# silence if the firmware ever started sending one.
+REPLACED_KEYS = frozenset({"temperature"})
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,22 @@ class Stamp:
     timestamp_ms: int | None
     source: str | None
     uptime_ms: int | None
+
+
+@dataclass(frozen=True)
+class AnchorState:
+    """An anchor and the run it describes, which are never separately true.
+
+    Frozen and rebound whole, so a reader on another thread gets one or the
+    other and never a mixture. Read as two attributes these tear: the drop path
+    has to rotate the run identity and clear the epoch, and between those two
+    stores the pair reads as this run's id beside the previous run's epoch.
+    `stamp_with_anchor` cannot catch that, because the tear is in the input its
+    own run gate compares.
+    """
+
+    value: int | None
+    run_id: str
 
 
 def client_ref_for(raw_line: bytes) -> str:
@@ -241,12 +261,16 @@ def is_drainable(envelope: dict[str, Any]) -> bool:
     A gate, not a correction. The API is create-only, so a resubmitted
     client_ref returns `duplicate` and never an update: there is no second pass
     that could fix a timestamp sent wrong the first time.
+
+    A type check rather than a null check, because the spool guarantees only
+    that a loaded entry is a dict. A corrupted `"1754400072000"` passes "is not
+    None" and reaches the uploader's arithmetic as a string.
     """
-    return envelope.get("timestamp_ms") is not None
+    return _is_plain_int(envelope.get("timestamp_ms"))
 
 
 def stamp_with_anchor(
-    envelope: dict[str, Any], anchor_ms: int, run_id: str
+    envelope: dict[str, Any], state: AnchorState
 ) -> dict[str, Any]:
     """A new envelope carrying the stamp an anchor now makes possible.
 
@@ -255,15 +279,23 @@ def stamp_with_anchor(
     any run but the one this anchor describes. An anchor from the run after a
     reset would shift a whole spool by the gap between the two boots, and the
     result is plausible, drainable and permanent.
+
+    Takes the pair as one value so a caller cannot read a live anchor's epoch
+    and run identity separately and compare a torn pair against the run gate.
     """
     uptime_ms = envelope.get("uptime_ms")
-    if is_drainable(envelope) or not isinstance(uptime_ms, int):
+    if state.value is None or not _is_plain_int(uptime_ms):
         return envelope
-    if envelope.get("run_id") != run_id:
+    # Not `is_drainable`: this fills gaps and a corrupt stamp is not a gap.
+    # Only an absent one is, so a mistyped value is left for the uploader to set
+    # aside rather than quietly replaced with a plausible number.
+    if envelope.get("timestamp_ms") is not None:
+        return envelope
+    if envelope.get("run_id") != state.run_id:
         return envelope
     return {
         **envelope,
-        "timestamp_ms": anchor_ms + uptime_ms,
+        "timestamp_ms": state.value + uptime_ms,
         "timestamp_source": SOURCE_ANCHOR,
     }
 
@@ -271,7 +303,7 @@ def stamp_with_anchor(
 def pico_epoch_ms(record: dict[str, Any]) -> int | None:
     """The Pico's own absolute stamp, or None if it never got one."""
     value = record.get("epoch_ms")
-    if isinstance(value, bool) or not isinstance(value, int):
+    if not _is_plain_int(value):
         return None
     # The firmware writes null rather than zero for an unsynced run, so a zero
     # here is a firmware that changed its mind, not a reading from 1970.
@@ -289,9 +321,13 @@ class Anchor:
 
     def __init__(self, counters: Counters) -> None:
         self._counters = counters
-        self._value: int | None = None
-        self._run_id = _new_run_id()
+        self._state = AnchorState(None, _new_run_id())
         self._last_uptime_ms: int | None = None
+        # Stays a plain attribute, deliberately, and does not join AnchorState.
+        # The reader thread writes it (note_serial_reconnect) while the capture
+        # thread writes the state, and folding it in would turn that write into
+        # a read-modify-write of a shared object. A drop notice lost that way
+        # leaves a stale anchor stamping the next run.
         self._pending_drop: str | None = None
         # A drop and the re-derivation after it are a pair, so neither may
         # swallow the other's line. Throttled at all because a cycle shorter
@@ -300,8 +336,17 @@ class Anchor:
         self._derive_log = Throttle(ANCHOR_LOG_INTERVAL_S)
 
     @property
+    def state(self) -> AnchorState:
+        """The epoch and the run it belongs to, as one indivisible read.
+
+        What anything off this thread should use. The two properties below are
+        conveniences for callers that genuinely want one half.
+        """
+        return self._state
+
+    @property
     def value(self) -> int | None:
-        return self._value
+        return self._state.value
 
     @property
     def run_id(self) -> str:
@@ -312,7 +357,7 @@ class Anchor:
         stamped from an anchor nothing can prove is theirs. That is the give-up
         rule: the Pico's card is the copy that survives.
         """
-        return self._run_id
+        return self._state.run_id
 
     def note_serial_reconnect(self) -> None:
         """Called from the reader thread on every reopen. The primary rule.
@@ -345,9 +390,9 @@ class Anchor:
         # Re-derive immediately rather than waiting for the next banner or sync
         # line. Waiting deadlocks in exactly the case this exists for: a run
         # whose Pi clock was still undisciplined at boot emits neither.
-        if self._value is None:
+        if self._state.value is None:
             self._derive(uptime_ms, pico_ms, received)
-        return self._value
+        return self._state.value
 
     def _take_pending_drop(self) -> None:
         reason = self._pending_drop
@@ -385,10 +430,15 @@ class Anchor:
         # The run identity goes even when there is no anchor to lose, because
         # the records already spooled from the run that just ended are exactly
         # the ones the next anchor must not reach.
-        self._run_id = _new_run_id()
-        if self._value is None:
+        #
+        # One rebind, not a store to each half. Rotating the run identity before
+        # clearing the epoch publishes the new run's id beside the old run's
+        # epoch, on every power cycle, and that pair stamps a whole spool with
+        # times shifted by the gap between two boots.
+        had_anchor = self._state.value is not None
+        self._state = AnchorState(None, _new_run_id())
+        if not had_anchor:
             return
-        self._value = None
         self._counters.bump("anchor_dropped")
         if self._drop_log.should_emit():
             log.info("dropped the boot-time anchor: %s; %d more suppressed since "
@@ -418,7 +468,10 @@ class Anchor:
         self._set(observed_ms - uptime_ms - EMIT_LAG_MS, "the Pi's clock at receipt")
 
     def _set(self, value: int, how: str) -> None:
-        self._value = value
+        # Rebound whole, same as _drop, so the pair is never half-written. The
+        # run identity is carried across unchanged: deriving an anchor says
+        # nothing about which run we are on, only what its epoch is.
+        self._state = AnchorState(value, self._state.run_id)
         self._counters.bump("anchor_derived")
         if self._derive_log.should_emit():
             log.info("anchored this run's boot at epoch %d ms, from %s", value, how)
@@ -523,6 +576,15 @@ class Recorder:
             log.warning("the Pico sent key(s) this mapping does not know about "
                         "(%s); they are stored but nothing can read them",
                         ", ".join(unknown))
+
+
+def _is_plain_int(value: Any) -> TypeGuard[int]:
+    """An int the arithmetic can use.
+
+    bool subclasses int, so an unguarded isinstance accepts True and reads it as
+    one millisecond. The same lesson `pico_epoch_ms` learned first.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _new_run_id() -> str:
