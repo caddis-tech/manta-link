@@ -132,6 +132,22 @@ BOOT_KEYS = frozenset({
     "temp_probes",
     "uv_probe",
     "boot_epoch_ms",
+    # The pH circuit's bring-up queries: calibration points, electrode slope,
+    # which pH scale is in effect, and the circuit's own firmware revision. Boot
+    # records are counted and dropped, so these never reach a payload. They are
+    # named here only to keep the unknown-key detector quiet enough to be worth
+    # reading when a genuinely new field arrives.
+    "ph_calibration",
+    "ph_slope",
+    "ph_scale",
+    "ph_device_info",
+    # And the conductivity circuit's: probe constant, TDS conversion factor, and
+    # which output parameters are enabled. `cond_probe_k` is the one to read: the
+    # firmware never sets it, so a probe that is not the default K 1.0 has been
+    # scaling every conductivity reading by a factor no single log would reveal.
+    "cond_probe_k",
+    "cond_tds_factor",
+    "cond_outputs",
     "truncated",
 })
 
