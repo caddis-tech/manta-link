@@ -1,0 +1,52 @@
+name: CI
+
+# The same three gates publish.yml runs, run on every PR and every push to a
+# long-lived branch instead of only at tag time.
+#
+# Without this, the first time a change is checked is the moment it is being
+# released, which is the worst moment to find out. The gates are duplicated in
+# publish.yml rather than shared: a reusable workflow would put an indirection
+# on the release path to save ten lines, and the release path is the one that
+# must not surprise anyone. If the two ever disagree, publish.yml wins -- it is
+# the one that decides whether an image reaches a boat.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -e ".[dev]"
+
+      # mypy is pinned to the Linux platform in pyproject, because fcntl and
+      # termios do not exist on the Windows box this is developed on and the
+      # container is the only platform that matters.
+      - run: ruff check .
+      - run: mypy manta_link
+      - run: pytest
+
+  manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No tag here, so the version check is skipped with the token
+      # tools/manifest.py defines for it. Everything else still runs: that every
+      # JSON LABEL parses, and that the permissions block still grants serial
+      # access. Kraken refuses an unparseable manifest silently, and a PR is
+      # where that should be found rather than during a release.
+      - run: python tools/manifest.py --no-tag
