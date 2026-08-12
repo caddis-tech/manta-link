@@ -6,7 +6,23 @@
 #   docker buildx build --platform linux/arm/v7 -t <registry>/manta-link:dev --push .
 FROM python:3.11-slim-bookworm
 
-RUN pip install --no-cache-dir pyserial==3.5
+# Must stay in step with pyproject.toml's dependencies, which CI installs and
+# this image does not. Nothing in the pipeline runs the built image, so a
+# dependency added to one and not the other is a green build, a published
+# image, and ModuleNotFoundError on first start on a boat. tests/test_manifest.py
+# asserts every runtime import appears in this line.
+#
+# The GPS poll deliberately does not need any of it: mavlink2rest.py is stdlib
+# http.client, so a plaintext loopback GET adds no dependency, no redirect
+# handling and no transitive audit surface. requests is here for the upload leg,
+# which needs TLS, certificate verification and connection reuse over cellular.
+RUN pip install --no-cache-dir \
+      pyserial==3.5 \
+      requests==2.34.2 \
+      certifi==2026.7.22 \
+      charset-normalizer==3.4.9 \
+      idna==3.18 \
+      urllib3==2.7.0
 
 COPY manta_link/ /app/manta_link/
 

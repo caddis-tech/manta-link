@@ -69,9 +69,14 @@ class Health:
         self,
         counters: Counters,
         heartbeat_interval_s: float = HEARTBEAT_INTERVAL_S,
+        on_beat: "Callable[[], object] | None" = None,
     ) -> None:
         self._counters = counters
         self._heartbeat_interval_s = heartbeat_interval_s
+        # Returns object, not None: the one caller returns bool, and return
+        # types are covariant, so Callable[[], None] would refuse it and
+        # `mypy manta_link` is a release gate.
+        self._on_beat = on_beat
         self._workers: dict[str, Worker] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._thread: threading.Thread | None = None
@@ -172,7 +177,24 @@ class Health:
     def _beat(self, now: float) -> None:
         """The only periodic proof of life. A POST replaces this in step 6."""
         self._last_beat = now
+        self._run_on_beat()
         self._counters.bump("heartbeats")
         tallies = self._counters.snapshot()
         log.info("heartbeat: %s",
                  ", ".join(f"{k}={v}" for k, v in sorted(tallies.items())))
+
+    def _run_on_beat(self) -> None:
+        """Run the periodic hook, without letting it cost us the heartbeat.
+
+        Wrapped the same way SerialReader._notify is, and for the same reason: a
+        hook that raises must not take out the only outbound signal a Release
+        boat has. Called before the tallies are read, so anything it counts
+        lands in the beat that reports it.
+        """
+        if self._on_beat is None:
+            return
+        try:
+            self._on_beat()
+        except Exception:
+            self._counters.bump("on_beat_failures")
+            log.exception("the heartbeat hook failed; continuing")

@@ -61,7 +61,7 @@ class TestTheBareStart:
 
         monkeypatch.setattr(__main__.logging_setup, "configure", fail)
         monkeypatch.setattr(__main__, "install_signal_handlers", fail)
-        monkeypatch.setattr(__main__, "build_recorder", fail)
+        monkeypatch.setattr(__main__, "build_durables", fail)
 
         with pytest.raises(SystemExit) as exit_info:
             __main__.main(["--dry-run"])

@@ -4,6 +4,7 @@ Kraken refuses a manifest it cannot parse and gives no reason, which makes a
 malformed LABEL an expensive thing to discover.
 """
 
+import ast
 import json
 import sys
 import tomllib
@@ -19,6 +20,27 @@ from tools import manifest  # noqa: E402
 @pytest.fixture(scope="module")
 def labels():
     return manifest.load()
+
+
+PACKAGE = manifest.DOCKERFILE.parent / "manta_link"
+
+
+def third_party_imports() -> set[str]:
+    """Every non-stdlib top-level module the package imports at runtime.
+
+    Parsed rather than imported, so this reports what the image needs rather
+    than what happens to be installed in the machine running the tests.
+    """
+    stdlib = sys.stdlib_module_names
+    found: set[str] = set()
+    for source in PACKAGE.glob("*.py"):
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                found.add(node.module.split(".")[0])
+    return {name for name in found if name not in stdlib}
 
 
 def dockerignore_patterns() -> list[str]:
@@ -107,6 +129,66 @@ class TestRealDockerfile:
 
     def test_the_build_context_excludes_the_virtualenv(self):
         assert ".venv/" in dockerignore_patterns()
+
+    def test_every_runtime_import_is_installed_by_the_image(self):
+        """The one gap the pipeline structurally cannot see.
+
+        CI runs `pip install -e ".[dev]"` and never runs the built image, so a
+        dependency added to pyproject and not to the Dockerfile is a green
+        build, a published image, and ModuleNotFoundError on first start on a
+        boat, over a link that has to work for the boat to be recoverable.
+
+        A substring match, which is exact for `requests` and coincidental for
+        `serial` inside `pyserial`. It would also miss a distribution whose
+        import name shares no text with it, `yaml` from `pyyaml` being the
+        obvious one. Worth knowing before adding a third dependency; it still
+        catches the failure it was written for, which is a name added to one
+        file and not the other.
+        """
+        dockerfile = manifest.join_continuations(
+            manifest.DOCKERFILE.read_text(encoding="utf-8")
+        )
+        pip_line = next(
+            line for line in dockerfile.splitlines() if "pip install" in line
+        )
+
+        for module in third_party_imports():
+            assert module in pip_line, f"{module} is imported but never installed"
+
+    def test_the_image_and_pyproject_pin_the_same_versions(self):
+        # Two copies of a pin drift the moment one is bumped alone, and the one
+        # that matters is the one nothing runs until a boat starts.
+        dockerfile = manifest.join_continuations(
+            manifest.DOCKERFILE.read_text(encoding="utf-8")
+        )
+        pyproject = tomllib.loads(
+            (manifest.DOCKERFILE.parent / "pyproject.toml").read_text(encoding="utf-8")
+        )
+
+        for requirement in pyproject["project"]["dependencies"]:
+            assert requirement in dockerfile, f"{requirement} is not in the image"
+
+    def test_the_image_declares_no_user_so_a_0600_root_env_file_is_readable(self):
+        """The token file is 0600 root:root and this reads it as uid 0.
+
+        A hardening commit adding USER here would break token reads on every
+        boat at once, and the symptom would be "uploads stopped", not
+        "permissions".
+        """
+        text = manifest.DOCKERFILE.read_text(encoding="utf-8")
+        assert not any(
+            line.strip().startswith("USER ") for line in text.splitlines()
+        )
+        assert "User" not in json.loads(
+            manifest.load()["permissions"]
+        ).get("HostConfig", {})
+
+    def test_no_line_in_the_image_names_a_token_value(self):
+        # The image is public on ghcr and its layers are world readable.
+        text = manifest.DOCKERFILE.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.strip().startswith(("ENV ", "ARG ")):
+                assert "TOKEN" not in line.upper(), line
 
 
 class TestParser:
