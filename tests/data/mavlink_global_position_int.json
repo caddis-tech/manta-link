@@ -1,0 +1,22 @@
+{
+  "message": {
+    "alt": 253250,
+    "hdg": 18258,
+    "lat": 399350992,
+    "lon": -829968149,
+    "relative_alt": -49,
+    "time_boot_ms": 2157109,
+    "type": "GLOBAL_POSITION_INT",
+    "vx": 0,
+    "vy": 4,
+    "vz": -1
+  },
+  "status": {
+    "time": {
+      "counter": 2156,
+      "first_update": "2026-08-11T12:39:35.231186182Z",
+      "frequency": 1.001393437385559,
+      "last_update": "2026-08-11T13:15:29.199621391Z"
+    }
+  }
+}

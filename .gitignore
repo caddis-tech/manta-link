@@ -1,2 +1,13 @@
 __pycache__/
 *.pyc
+
+# Tooling caches, local environments, and editable-install metadata
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+
+# The API token, once there is one. Never committed: it is a per-boat device
+# credential, and the only copy that should exist is the caddis-api Device row.
+.env

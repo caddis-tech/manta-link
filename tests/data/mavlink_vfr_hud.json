@@ -1,0 +1,19 @@
+{
+  "message": {
+    "airspeed": 0.049000002443790436,
+    "alt": 253.25,
+    "climb": 0.010879251174628735,
+    "groundspeed": 0.043925825506448746,
+    "heading": 182,
+    "throttle": 0,
+    "type": "VFR_HUD"
+  },
+  "status": {
+    "time": {
+      "counter": 2156,
+      "first_update": "2026-08-11T12:39:35.232302599Z",
+      "frequency": 1.001393437385559,
+      "last_update": "2026-08-11T13:15:29.200484975Z"
+    }
+  }
+}
