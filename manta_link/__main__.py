@@ -32,6 +32,7 @@ from . import (
     record,
     spool,
     supervisor,
+    upload,
 )
 from .health import Counters, Health
 from .reader import SerialReader
@@ -88,10 +89,13 @@ def data_volume() -> Path:
     return Path(os.environ.get(VOLUME_ENV, DEFAULT_VOLUME))
 
 
-def build_recorder(
+def build_durables(
     counters: Counters, positions: "gps.PositionCache | None" = None
-) -> record.Recorder:
+) -> "tuple[record.Recorder, spool.Spool]":
     """The durable half: where a reading is put, and what it is put as.
+
+    Returns the spool as well as the recorder, because the uploader drains the
+    same object the recorder fills and there is only ever one of it.
 
     Nothing here is allowed to end the process. A spool that cannot be opened
     costs records, which is bad; a process that will not start costs the port
@@ -106,7 +110,7 @@ def build_recorder(
 
     open_or_carry_on("spool", store.open)
     open_or_carry_on("archive", ring.open)
-    return record.Recorder(store, ring, counters, position=positions)
+    return record.Recorder(store, ring, counters, position=positions), store
 
 
 def register_gps(
@@ -172,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     records = capture.new_record_buffer()
     logs = capture.new_log_buffer()
     positions = gps.PositionCache()
-    recorder = build_recorder(counters, positions)
+    recorder, store = build_durables(counters, positions)
 
     tokens = config.TokenSession()
     watcher = config.ConfigWatcher(data_volume(), tokens)
@@ -187,6 +191,8 @@ def main(argv: list[str] | None = None) -> int:
     health = Health(counters, on_beat=watcher.reload)
     health.register("capture", worker.run_forever)
     register_gps(health, positions, counters)
+    uploader = upload.Uploader(store, recorder.anchor, tokens, watcher, counters)
+    health.register("uploader", uploader.run_forever)
     health.start()
 
     reader = SerialReader(

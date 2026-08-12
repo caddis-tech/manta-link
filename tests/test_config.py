@@ -7,8 +7,10 @@ forever while the process reports healthy. A plaintext API URL copied off a
 bench puts a live device credential on the wire in clear. None of them raise.
 """
 
+import ast
 import stat
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -92,14 +94,30 @@ class TestReloadReachesTheLiveSession:
         assert binding.fingerprint == config.fingerprint_of(TOKEN)
 
     def test_only_config_ever_writes_an_authorization_header(self):
-        """Structural, because the rule is otherwise only a convention."""
-        package = config.__file__.rsplit("config.py", 1)[0]
+        """Structural, because the rule is otherwise only a convention.
+
+        Looks for the assignment rather than the word. Other modules discuss the
+        header in comments, and they should: upload.py's reason for logging an
+        exception's type instead of the exception is that the exception can
+        carry the request and the request carries this header.
+        """
+        package = Path(config.__file__).parent
         offenders = []
-        for source in __import__("pathlib").Path(package).glob("*.py"):
+
+        for source in package.glob("*.py"):
             if source.name == "config.py":
                 continue
-            if "Authorization" in source.read_text(encoding="utf-8"):
-                offenders.append(source.name)
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Assign):
+                    continue
+                for target in node.targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.slice, ast.Constant)
+                        and target.slice.value == "Authorization"
+                    ):
+                        offenders.append(f"{source.name}:{node.lineno}")
 
         assert offenders == []
 

@@ -121,12 +121,17 @@ def stub_out_the_hardware(monkeypatch, run_forever) -> None:
     monkeypatch.setattr(__main__, "install_signal_handlers", lambda: None)
     monkeypatch.setattr(
         __main__,
-        "build_recorder",
-        lambda *_, **__: SimpleNamespace(
-            capture=lambda *_, **__: None,
-            anchor=SimpleNamespace(
-                note_serial_reconnect=lambda: None, note_banner=lambda: None
+        "build_durables",
+        lambda *_, **__: (
+            SimpleNamespace(
+                capture=lambda *_, **__: None,
+                anchor=SimpleNamespace(
+                    note_serial_reconnect=lambda: None,
+                    note_banner=lambda: None,
+                    state=None,
+                ),
             ),
+            SimpleNamespace(directory=Path("."), names=list, load=lambda _n: None),
         ),
     )
     monkeypatch.setattr(
