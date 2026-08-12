@@ -179,7 +179,7 @@ BlueOS web UI, Extensions, **Installed** tab, the **+** button, then:
 | Extension Identifier | `caddis.manta-link` |
 | Extension Name | `MANTA Link` |
 | Docker image | `ghcr.io/caddis-tech/manta-link` |
-| Docker tag | a pinned version such as `0.5.0` |
+| Docker tag | a pinned version such as `0.9.0` |
 | Custom settings | leave empty; the image's own `permissions` label is used |
 
 Pin the tag rather than using `latest`, so the Extensions Manager shows which
@@ -190,13 +190,69 @@ Requires BlueOS 1.4.x. Images are published for `linux/arm/v7` and
 credentials. Kraken has no offline install, so the boat needs a route to
 ghcr.io to install or update, though not to keep running once installed.
 
+### The API token
+
+**Install without one.** A missing token is a normal state, not an error:
+nothing POSTs, nothing spins, and capture, spooling and `TIME?` all carry on.
+Uploads begin whenever a token turns up. Getting the extension running and
+provisioning it are two separate jobs and do not have to happen in one visit.
+
+The token goes in a `.env` on the extension's persistent volume:
+
+```bash
+ssh <boat> 'printf "CADDIS_API_TOKEN=%s\n" "<token>" > /app/data/.env'
+```
+
+`/app/data` is the default; `AQUADRONE_DATA_DIR` overrides it. The file is read
+again on every heartbeat, so a token dropped in starts uploads **within a minute
+with no restart**, and a 401 or 403 self-heals the same way once a good one
+replaces it.
+
+**Write it over SSH, not through Commander's `rig()` helper.** That helper is
+`curl -G --data-urlencode`, so the token would land in a query string, in shell
+history, and in Commander's request log.
+
+`CADDIS_API_TOKEN` is also read from the environment, which means Kraken's Env
+field works too. The file wins if both are set. Kraken's field is visible in the
+BlueOS UI to anyone who can reach it, so prefer the file.
+
+Two other knobs, both optional: `CADDIS_API_URL` (default
+`https://api.caddistech.com`) and `CADDIS_BATCH_MAX` (default 50).
+
+#### Rotation
+
+Overwrite the line. The next heartbeat rebinds, and the log says so:
+
+```
+API token changed from 3f9a1c2e to 8b4d0e77 (source: file)
+```
+
+Those are the first 8 characters of a SHA-256, not the token. **The token is
+never logged**, and neither is any transport error message, because a `requests`
+exception can carry the header it failed on.
+
+Rotation replaces the whole session rather than re-heading a live one, so an
+in-flight POST finishes on the credential it started with. There is no window
+where a retired token is still in use, which is the failure this design exists
+to prevent: it is silent, and the operator believes the old credential is dead.
+
 ### Replacing the time responder
 
-Install this one **first**, confirm it is running, then uninstall
+**On a boat, install this one first**, confirm it is running, then uninstall
 `caddis.aquadrone-time-responder`. The reverse order leaves a boat with nothing
 on the port if the pull fails, which over a cellular link is not recoverable
 from shore. The brief overlap is harmless because the Pico is already synced by
 then.
+
+**On a bench rig, do it the other way round**: uninstall the responder first,
+then install this. That advice is not a contradiction, it is a different
+question. The order above trades a certain small risk for an uncertain large
+one, and the large one is "no route back to the boat" -- which does not exist on
+a rig you can reach with a cable. What is left is the overlap, and on a rig the
+overlap is the real risk: two processes both want one tty, `exclusive=True` is
+advisory flock, and `TIOCEXCL` is defeated by the `CAP_SYS_ADMIN` this container
+holds. `TIME?` requests then split non-deterministically between them and every
+log line afterwards is worthless.
 
 Then power-cycle the Pico to prove the `TIME?` path end to end.
 
@@ -215,6 +271,18 @@ one `answered with 1754422392123`. After that it says almost nothing: a
 and on a Debug image a count of the records captured. **That near-silence is
 correct and is the whole point**; the periodic lines exist so a wedged port and
 a dead worker look different from a quiet boat.
+
+With no token it also logs `no API token configured; uploads are off` once, and
+that is the whole of it. It does not retry, does not back off, and does not
+count that as a failure, so an unprovisioned boat looks exactly as quiet as a
+provisioned one. Confirm it is still *working* from the heartbeat's spool
+counters rather than from the absence of upload lines.
+
+When a token arrives, one `API token loaded, fingerprint 3f9a1c2e (source:
+file)` and the spool starts draining. Two counters on the heartbeat are the ones
+to read: `spool_write_failures` above zero means a read-only bind and the boat is
+storing nothing, and `readings_quarantined` above zero means a batch the API kept
+refusing has been set aside so the rest of the queue can move.
 
 On the Pico's serial stream:
 
@@ -269,7 +337,7 @@ Tag it. CI runs the tests and validates the manifest against the tag before
 anything is pushed.
 
 ```bash
-git tag v0.5.0
+git tag v0.9.0
 git push --tags
 ```
 

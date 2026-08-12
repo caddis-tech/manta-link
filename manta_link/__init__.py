@@ -12,4 +12,4 @@ making them durable: a spool for the upload to drain, and an archive that keeps
 a copy on the boat. The upload itself lands on top of the same reader.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.9.0"
