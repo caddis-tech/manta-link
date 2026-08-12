@@ -50,7 +50,7 @@ ENV AQUADRONE_DATA_DIR=/app/data
 #
 # Kraken refuses a manifest it cannot parse and does not say why, so CI parses
 # every LABEL below as JSON and asserts this version matches the git tag.
-LABEL version="0.5.0"
+LABEL version="0.9.0"
 
 # Privileged with a /dev bind is verbatim what the docs prescribe for reaching
 # connected serial devices, and it is what any container needs to open a USB CDC
