@@ -122,6 +122,16 @@ reads `water_temperature` rather than `temperature`. A verbatim copy returns
 the API cannot read still travel in the blob, and one the Pico has never sent
 before is counted and named in the log rather than passed through in silence.
 
+`cond_fault`, `ph_fault`, `temp_fault` and `uv_fault` are the per-probe
+verdicts, one per channel, and the firmware emits all four on every record
+whatever is fitted. They are passed through as the booleans they already are.
+A fault never suppresses the value beside it, which is the point: a railed pH
+and a silent conductivity circuit both arrive as a perfectly plausible number,
+and the flag is the only thing that says otherwise. **caddis-api has no reader
+property for any of the four yet**, so they travel in the blob and are
+invisible to the admin and the dashboards until one is added -- the same gap
+`uv_index` has, on the fields most worth alerting on.
+
 `client_ref` is `uuid5` of the raw Pico line, so every copy of one reading
 resolves to the same row: the live upload, a retry after a lost acknowledgement,
 the archive stick and the Pico's own card.
