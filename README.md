@@ -190,7 +190,49 @@ BlueOS web UI, Extensions, **Installed** tab, the **+** button, then:
 | Extension Name | `MANTA Link` |
 | Docker image | `ghcr.io/caddis-tech/manta-link` |
 | Docker tag | a pinned version such as `0.9.1` |
-| Custom settings | leave empty; the image's own `permissions` label is used |
+| Custom settings | the JSON below, pasted in full |
+
+```json
+{
+  "Env": [
+    "CADDIS_API_TOKEN=<token>",
+    "CADDIS_API_URL=https://api.caddistech.com"
+  ],
+  "HostConfig": {
+    "Privileged": true,
+    "NetworkMode": "host",
+    "Binds": [
+      "/dev:/dev:rw",
+      "/usr/blueos/extensions/manta-link:/app/data:rw",
+      "/media:/media:rw,rslave"
+    ],
+    "RestartPolicy": {"Name": "unless-stopped"}
+  }
+}
+```
+
+Two halves. `HostConfig` is the Dockerfile's `permissions` label with the
+backslash continuations taken out, and the two have to be changed together:
+the Dockerfile's copy is what CI validates, and this one is what a boat
+actually runs on. `Env` is the boat-specific half, and it is where the token
+lives -- see below.
+
+**A manual install does not read the image's `permissions` label.** Only a
+Bazaar install gets that, and it gets it from the Extensions Repository
+manifest rather than from the image. Leaving the field empty stores `{}` and
+installs a container that starts and does nothing useful: unprivileged and
+with no `/dev` bind it never opens the Pico, so no records and no `TIME?`;
+with no volume bind there is nowhere for the spool to live; and with no host
+networking mavlink2rest is connection-refused. Three symptoms that look like
+unrelated bugs and name nothing.
+
+State `CADDIS_API_URL` rather than leaving it to the default. The default is
+production, so an unset value is also how a bench boat silently uploads to
+production while reporting perfect health.
+
+**Already installed?** The same block goes in **Edit** -- the pencil on the
+extension's card -- under Custom settings. Kraken recreates the container on
+save, so the boat is briefly without a `TIME?` responder while it does.
 
 Pin the tag rather than using `latest`, so the Extensions Manager shows which
 build a boat is actually running.
@@ -207,31 +249,52 @@ nothing POSTs, nothing spins, and capture, spooling and `TIME?` all carry on.
 Uploads begin whenever a token turns up. Getting the extension running and
 provisioning it are two separate jobs and do not have to happen in one visit.
 
-The token goes in a `.env` on the extension's persistent volume:
+The token goes in the `Env` array of the Custom settings above, which is how
+boats in service carry theirs:
+
+```
+"CADDIS_API_TOKEN=<token>"
+```
+
+Installing without one means omitting that line, not setting it empty: an
+empty value is refused the same as a malformed one.
+
+**Kraken has no partial update.** The settings you send become the extension's
+entire configuration, so an `Env` entry left out of a reinstall is one the
+container loses. Reinstalling is how a boat's permissions get repaired, which
+makes it exactly the operation that silently drops a hand-provisioned token --
+read the boat's current `Env` and carry it forward before sending a new one.
+
+A `.env` on the persistent volume works too, and **wins if both are set**:
 
 ```bash
 ssh <boat> 'printf "CADDIS_API_TOKEN=%s\n" "<token>" > /app/data/.env'
 ```
 
-`/app/data` is the default; `AQUADRONE_DATA_DIR` overrides it. The file is read
-again on every heartbeat, so a token dropped in starts uploads **within a minute
-with no restart**, and a 401 or 403 self-heals the same way once a good one
-replaces it.
+`/app/data` is the default; `AQUADRONE_DATA_DIR` overrides it. The difference
+that matters is restart, not precedence: the file is re-read on every
+heartbeat, so a token dropped in starts uploads **within a minute with no
+restart**, while editing Kraken's `Env` recreates the container -- the one
+event that can lose an in-flight `TIME?`. Use the file to rotate a token on a
+boat that is up; use `Env` to provision one, which is the only path that does
+not need SSH.
 
-**Write it over SSH, not through Commander's `rig()` helper.** That helper is
-`curl -G --data-urlencode`, so the token would land in a query string, in shell
-history, and in Commander's request log.
+**If you use the file, write it over SSH, not through Commander's `rig()`
+helper.** That helper is `curl -G --data-urlencode`, so the token would land
+in a query string, in shell history, and in Commander's request log. That is
+worth avoiding because it copies the token to places off the boat that nobody
+thinks to clean up, not because reading it on the boat is hard.
 
-`CADDIS_API_TOKEN` is also read from the environment, which means Kraken's Env
-field works too. The file wins if both are set. Kraken's field is visible in the
-BlueOS UI to anyone who can reach it, so prefer the file.
+**Env versus the file is not a security decision.** Anyone who can reach the
+boat can read the token either way -- the BlueOS UI shows `Env`, and a shell
+reads the file. Choose on restart behaviour, above, and nothing else.
 
-Two other knobs, both optional: `CADDIS_API_URL` (default
-`https://api.caddistech.com`) and `CADDIS_BATCH_MAX` (default 50).
+One other knob, optional: `CADDIS_BATCH_MAX` (default 50).
 
 #### Rotation
 
-Overwrite the line. The next heartbeat rebinds, and the log says so:
+Overwrite the `.env` line. The next heartbeat rebinds with no restart, and
+the log says so:
 
 ```
 API token changed from 3f9a1c2e to 8b4d0e77 (source: file)
@@ -240,6 +303,9 @@ API token changed from 3f9a1c2e to 8b4d0e77 (source: file)
 Those are the first 8 characters of a SHA-256, not the token. **The token is
 never logged**, and neither is any transport error message, because a `requests`
 exception can carry the header it failed on.
+
+Rotating through Kraken's `Env` instead recreates the container, so the new
+token is live at the next start rather than the next heartbeat.
 
 Rotation replaces the whole session rather than re-heading a live one, so an
 in-flight POST finishes on the credential it started with. There is no window
@@ -268,11 +334,44 @@ Then power-cycle the Pico to prove the `TIME?` path end to end.
 
 ## Checking it worked
 
-On the Pi:
+**The BlueOS terminal has no `docker` CLI**, so `docker logs` does not work on
+a boat. Read the log through Kraken instead, from anything that can reach the
+vehicle:
 
 ```bash
-docker logs -f $(docker ps -q --filter name=manta-link)
+curl -sG http://<boat>:9134/v1.0/log \
+  --data-urlencode "container_name=extension-ghcriocaddistechmantalink091"
 ```
+
+The container name is the image reference with every non-alphanumeric character
+stripped and `extension-` on the front, so the version tag is part of it and it
+changes on every bump. `GET /v1.0/list_containers` on the same port lists the
+real names.
+
+The response is not plain text. It is a stream of JSON fragments whose `data`
+field is base64, interleaved with Kraken keepalives that decode to the bare
+string `heartbeat` -- discard those. MANTA Link's own counter line is
+`heartbeat:` with a colon.
+
+With SSH to the host rather than the BlueOS terminal, `docker logs` works as
+normal.
+
+### What a healthy start proves
+
+Four lines, each proving a different part of the Custom settings block took.
+A missing line names the part that did not:
+
+| Line | Proves |
+|---|---|
+| `listening on /dev/ttyACM0` | `Privileged` and the `/dev` bind |
+| `polling MAVLink2Rest at http://127.0.0.1:6040` | `NetworkMode: host` |
+| `API token loaded, fingerprint ... (source: environment)` | the `Env` entry |
+| `heartbeat: ... records_spooled=` climbing | the data volume bind is writable |
+
+`source: environment` means the token came from Kraken's Env; `source: file`
+means a `.env` on the volume. Counters that are zero are omitted from the
+heartbeat entirely, so `spool_write_failures` is absent on a healthy boat rather
+than reported as 0 -- read `records_spooled` climbing as the positive signal.
 
 A healthy boot logs `listening on /dev/ttyACM0`, then some number of
 `request received, clock not yet synced; silent` while the Pi gets online, then
