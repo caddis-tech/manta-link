@@ -165,13 +165,17 @@ class TestFieldMapping:
             "sd_ready": 1,
             "sd_writes_failed": 0,
             "sd_mounts_failed": 0,
+            "cond_fault": False,
             "cond_tds_sal": "210,105,0.10",
             "conductivity": 210.0,
             "tds": 105.0,
             "salinity": 0.1,
+            "ph_fault": False,
             "ph": 7.234,
+            "temp_fault": False,
             "temp_code": "0x1a2b",
             "water_temperature": 18.4,
+            "uv_fault": False,
             "uv_present": True,
             "uv_counts": 812,
             "uv_mv": 654,
@@ -189,6 +193,59 @@ class TestFieldMapping:
         assert payload["uv_index"] is None
         assert payload["uv_saturated"] is True
         assert payload["uv_mv"] == 1128
+
+    def test_the_four_fault_flags_arrive_as_real_booleans(self):
+        """The per-probe verdicts, which are the whole point of reading a record
+        at all when a channel is misbehaving.
+
+        Passed through rather than coerced, exactly as uv_saturated is: the
+        firmware writes them with rj_bool, so they are already JSON booleans and
+        the only thing _as_number could do here is turn False into None.
+        """
+        payload = record.to_payload(reading())
+        for key in ("cond_fault", "ph_fault", "temp_fault", "uv_fault"):
+            assert payload[key] is False, key
+
+    def test_a_fault_never_suppresses_the_value_beside_it(self):
+        """AquadronePicoFirmware A13 (#123): the flag is added, nothing is taken
+        away. A railed pH and a dead conductivity circuit both arrive as
+        perfectly plausible numbers, and the flag is the only thing that says
+        otherwise -- so a mapping that dropped the value on a fault, or the flag
+        on a value, would erase exactly the case this exists for."""
+        payload = record.to_payload(
+            reading(ph_fault=True, ph="7.234", cond_fault=True)
+        )
+        assert payload["ph_fault"] is True
+        assert payload["ph"] == 7.234
+        assert payload["cond_fault"] is True
+        assert payload["conductivity"] == 210.0
+
+    def test_a_boat_with_no_uv_module_reports_the_fault_every_cycle(self):
+        """Frank carries no UV module, so uv_fault is true on every record it
+        will ever write. That is reported rather than suppressed: which hull a
+        record came from is known at ingest from the token, and the firmware
+        chose uniformity across channels over silencing a constant on one boat.
+        """
+        payload = record.to_payload(
+            reading(uv_fault=True, uv_present=False, uv_counts=None,
+                    uv_mv=None, uv_index=None, uv_saturated=None)
+        )
+        assert payload["uv_fault"] is True
+        assert payload["uv_present"] is False
+        assert payload["uv_index"] is None
+
+    def test_a_fault_flag_lost_to_truncation_is_absent_rather_than_false(self):
+        """The one default that must never be invented.
+
+        A record too big for the buffer sheds trailing fields whole and says so
+        with `truncated`, and the record is fullest exactly when a circuit is
+        misbehaving. Defaulting a missing flag to False would call that channel
+        healthy on the one record that exists to say it is not.
+        """
+        parsed = reading(truncated=True)
+        del parsed["temp_fault"]
+        payload = record.to_payload(parsed)
+        assert "temp_fault" not in payload
 
     def test_temperature_is_renamed_rather_than_duplicated(self):
         payload = record.to_payload(reading())
@@ -288,6 +345,23 @@ class TestMappingRot:
             "truncated": True,
         }
         assert record.unknown_keys(emitted_by_every_build) == []
+
+    def test_the_fault_flags_are_known_keys(self):
+        """Named one by one rather than left to the golden line.
+
+        These are what 0.9.0 on Quentin logged on every cycle -- four unknown
+        keys a record, 916 of them over 229 records -- and a detector firing
+        that often is one nobody reads by the time a genuinely new field
+        arrives. Naming them here says which four, so dropping one from
+        PICO_KEYS fails with the key in the message.
+        """
+        faults = {
+            "cond_fault": False,
+            "ph_fault": False,
+            "temp_fault": False,
+            "uv_fault": False,
+        }
+        assert record.unknown_keys(faults) == []
 
     def test_the_golden_line_bumps_nothing(self, counters):
         calls: list[str] = []

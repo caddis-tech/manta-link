@@ -103,10 +103,24 @@ PICO_KEYS = frozenset({
     "sd_ready",
     "sd_writes_failed",
     "sd_mounts_failed",
+    # One per probe, and the most alert-worthy thing a record carries: each is
+    # the channel's own verdict on whether the value beside it means anything.
+    # The firmware derives them at render time from the same bytes it renders
+    # the value from (AquadronePicoFirmware#124), so a flag cannot disagree
+    # with its reading, and it emits all four on every record whatever is
+    # fitted -- Frank carries no UV module and still reports uv_fault true.
+    #
+    # A fault never suppresses the value, so these are the only way to tell a
+    # railed pH from a real one or a dead conductivity circuit from a calm
+    # pond: both of those arrive as a perfectly plausible number.
+    "cond_fault",
     "cond_tds_sal",
+    "ph_fault",
     "ph",
+    "temp_fault",
     "temp_code",
     "temperature",
+    "uv_fault",
     "uv_present",
     "uv_counts",
     "uv_mv",

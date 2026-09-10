@@ -8,12 +8,23 @@ assert an exact payload against it, so a firmware change should move this file
 and break those tests loudly, which is the only way a silent read-layer
 mismatch ever becomes visible.
 
-Both lines came out of the firmware's own record_json_reading()
-(AquadronePicoFirmware ecdd3dc, branch fix/d1-both-sinks), not off a boat and
-not typed here. The hand-written literal they replace disagreed with that writer
-in four places at once: an uppercase hex temp_code, a fractional uv_index, an
-integer uv_saturated and a one-decimal temperature are none of them shapes the
-firmware can emit, and no test in the suite could see the difference.
+Both lines came out of the firmware's own record_json_reading(), not off a boat
+and not typed here. The hand-written literal they replace disagreed with that
+writer in four places at once: an uppercase hex temp_code, a fractional
+uv_index, an integer uv_saturated and a one-decimal temperature are none of them
+shapes the firmware can emit, and no test in the suite could see the difference.
+
+Re-rendered from that writer at AquadronePicoFirmware 2.1.2 (c9894f5) when A13
+(#124) added the four `<channel>_fault` booleans, which 0.9.0 on Quentin was
+logging as unknown keys on every cycle. Field order is the writer's own: each
+flag is offered immediately before the value it qualifies.
+
+`ms_since_boot` is the one field held back from that re-render. The 2.1.2 writer
+emits it unconditionally, but leaving it out keeps these lines the shape of a
+firmware without it, which is the only shape that exercises the h:mm:ss fallback
+in uptime_ms_from() through the golden line. Adding it is a deliberate separate
+change, and unstamped_line() in test_record.py already keys off whether it is
+here.
 
 firmware_version's value is whatever a given build stamped in, so nothing should
 assert on it beyond its shape. That every record carries one is the part that
