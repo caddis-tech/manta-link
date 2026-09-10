@@ -281,11 +281,13 @@ not need SSH.
 
 **If you use the file, write it over SSH, not through Commander's `rig()`
 helper.** That helper is `curl -G --data-urlencode`, so the token would land
-in a query string, in shell history, and in Commander's request log.
+in a query string, in shell history, and in Commander's request log. That is
+worth avoiding because it copies the token to places off the boat that nobody
+thinks to clean up, not because reading it on the boat is hard.
 
-Either way the token is readable by anyone who can reach the boat -- in the
-BlueOS UI for `Env`, over SSH for the file. That is a known tradeoff, not an
-oversight.
+**Env versus the file is not a security decision.** Anyone who can reach the
+boat can read the token either way -- the BlueOS UI shows `Env`, and a shell
+reads the file. Choose on restart behaviour, above, and nothing else.
 
 One other knob, optional: `CADDIS_BATCH_MAX` (default 50).
 
