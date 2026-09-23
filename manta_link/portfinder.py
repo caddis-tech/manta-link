@@ -1,6 +1,7 @@
 """Locating the Pico among the USB serial devices on the boat."""
 
 import logging
+from pathlib import Path
 
 from serial.tools import list_ports
 
@@ -34,3 +35,27 @@ def find_pico_port() -> "str | None":
         log.warning("%d devices with VID 0x%04X (%s); using %s",
                     len(matches), PICO_VID, ", ".join(matches), matches[0])
     return matches[0]
+
+
+def usb_device_node(port_path: str) -> "str | None":
+    """The /dev/bus/usb node of the USB device behind a port, or None.
+
+    pyserial finds each port's USB device directory in sysfs as it lists them,
+    the same listing find_pico_port reads, and busnum and devnum there name the
+    node. devnum changes on every enumeration, so this is looked up when needed
+    and never kept.
+    """
+    for port in list_ports.comports():
+        if port.device != port_path:
+            continue
+        # Only pyserial's Linux listing carries this attribute.
+        usb_path = getattr(port, "usb_device_path", None)
+        if not usb_path:
+            return None
+        try:
+            bus = int(Path(usb_path, "busnum").read_text())
+            dev = int(Path(usb_path, "devnum").read_text())
+        except (OSError, ValueError):
+            return None
+        return f"/dev/bus/usb/{bus:03d}/{dev:03d}"
+    return None

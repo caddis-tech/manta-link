@@ -381,6 +381,18 @@ and on a Debug image a count of the records captured. **That near-silence is
 correct and is the whole point**; the periodic lines exist so a wedged port and
 a dead worker look different from a quiet boat.
 
+**If the Pico's stream stops.** A running Pico sends something every few
+seconds, so a port that has carried bytes and then stays silent for 60 s is a
+stalled link, not a quiet boat. On 2026-09-22 one stayed that way, open and
+error-free, for the last 45 minutes of a run. MANTA Link then logs
+`no bytes from /dev/ttyACM0 for 60s; resetting the USB device` and resets the
+Pico's USB device, the equivalent of a replug without cutting power: the Pico
+keeps running and keeps recording to its card. `reset USB device
+/dev/bus/usb/...` confirms the reset, and `listening on /dev/ttyACM0` follows
+once the device is back. `could not reset ...` means it fell back to a plain
+reopen. A port that has not carried any bytes since it was opened is never
+reset, so a Pico that is silent by design is left alone.
+
 With no token it also logs `no API token configured; uploads are off` once, and
 that is the whole of it. It does not retry, does not back off, and does not
 count that as a failure, so an unprovisioned boat looks exactly as quiet as a
