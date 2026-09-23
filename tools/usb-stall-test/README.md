@@ -38,12 +38,15 @@ disabled so only one process owns the port:
    minute. A warning that the Pico sent a key the mapping doesn't know
    (`stall_test_line`) is expected.
 3. After the 12th record it stops climbing. 60 s later:
-   `no bytes from /dev/ttyACM0 for 60s; resetting the USB device`, then
+   `no bytes from /dev/ttyACM0 for 60s; resetting the USB device (1 of 3)`,
+   then
    `reset USB device /dev/bus/usb/...` and `listening on /dev/ttyACM0`. On the
    Pi, `dmesg` shows `reset full-speed USB device number N`. There is no
    `dropped the boot-time anchor` line: the Pico kept running, so its run
    carries on.
 4. `records_captured` climbs again. Let it run through at least three wedges.
+   Each should say `(1 of 3)`: a `(2 of 3)` means the first reset didn't bring
+   the records back and MANTA Link had to retry.
 
 Each wedge costs about a minute of records, as a real stall would. On a boat
 those records are on the SD card.

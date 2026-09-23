@@ -385,14 +385,17 @@ a dead worker look different from a quiet boat.
 few seconds, so a port that has carried records and then stays silent for 60 s
 is a stalled link, not a quiet boat. On 2026-09-22 one stayed that way, open and
 error-free, for the last 45 minutes of a run. MANTA Link then logs
-`no bytes from /dev/ttyACM0 for 60s; resetting the USB device` and resets the
-Pico's USB device, the equivalent of a replug without cutting power: the Pico
-keeps running and keeps recording to its card. `reset USB device
+`no bytes from /dev/ttyACM0 for 60s; resetting the USB device (1 of 3)` and
+resets the Pico's USB device, the equivalent of a replug without cutting power:
+the Pico keeps running and keeps recording to its card. `reset USB device
 /dev/bus/usb/...` confirms the reset, and `listening on /dev/ttyACM0` follows
 once the device is back. `could not reset ...` means it fell back to a plain
-reopen. The Pico's run carries on through a reset, so its timestamps do too.
-Only records arm the reset, so a Pico that keeps its records off USB is left
-alone, however quiet it is.
+reopen. Records resuming is what shows it worked. If none arrive within another
+60 s, it resets again, up to three times in a row, and a record in between
+starts the count over. After the third it leaves the port open and quiet. The
+Pico's run carries on through a reset, so its timestamps do too. Only records
+arm the reset, so a Pico that keeps its records off USB is left alone, however
+quiet it is.
 
 With no token it also logs `no API token configured; uploads are off` once, and
 that is the whole of it. It does not retry, does not back off, and does not

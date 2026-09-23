@@ -67,6 +67,12 @@ ALIVE_LOG_INTERVAL_S = 600.0
 # the Pico's card.
 SILENCE_RESET_S = 60.0
 
+# A reset that fails, or does not bring the stream back, is tried again: the
+# port it reopens has no records to arm it. At most this many in a row with no
+# record between them, so a Pico that has stopped streaming for good is then
+# left alone.
+MAX_SILENCE_RESETS = 3
+
 # From <linux/usbdevice_fs.h>: _IO('U', 20). Python's fcntl does not name it.
 USBDEVFS_RESET = 0x5514
 
@@ -92,6 +98,8 @@ class SerialReader:
         self._on_banner = on_banner
         self._assembler = LineAssembler()
         self._absent_log = Throttle(ABSENT_LOG_INTERVAL_S)
+        # Silence resets since the last record.
+        self._silence_resets = 0
         self.answered_count = 0
         self.connected = False
 
@@ -163,10 +171,11 @@ class SerialReader:
 
             last_alive = time.monotonic()
             byte_count = 0
-            # Armed by the first record on this open. Boot lines alone arm
-            # nothing, so an image that sends no records over USB is never
-            # reset, and neither is a Pico still silent after a reset.
-            streaming = False
+            # Armed by the first record on this open, or from the start while
+            # retrying a reset that has not brought the stream back. Boot lines
+            # alone arm nothing, so an image that sends no records over USB is
+            # never reset.
+            armed = 0 < self._silence_resets < MAX_SILENCE_RESETS
             last_byte_at = last_alive
 
             while True:
@@ -179,10 +188,14 @@ class SerialReader:
                     last_byte_at = now
                     for line in self._assembler.feed(chunk):
                         if self._dispatch(link, line, now) is Kind.RECORD:
-                            streaming = True
-                elif streaming and now - last_byte_at >= SILENCE_RESET_S:
+                            armed = True
+                            self._silence_resets = 0
+                elif armed and now - last_byte_at >= SILENCE_RESET_S:
+                    self._silence_resets += 1
                     log.warning("no bytes from %s for %.0fs; resetting the USB "
-                                "device", port_path, now - last_byte_at)
+                                "device (%d of %d)", port_path,
+                                now - last_byte_at, self._silence_resets,
+                                MAX_SILENCE_RESETS)
                     break
 
                 if now - last_alive >= ALIVE_LOG_INTERVAL_S:
