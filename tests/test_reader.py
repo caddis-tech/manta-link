@@ -247,7 +247,7 @@ class _Clock:
 
 
 class TestSilence:
-    """A port that has carried bytes and then stops is reset, once.
+    """A Pico that has been streaming records and then goes quiet is reset, once.
 
     On 2026-09-22 a Pico's stream stopped mid-run with the port still open and
     no error anywhere, and nothing noticed for the last 45 minutes of the run.
@@ -288,27 +288,35 @@ class TestSilence:
         self, monkeypatch, caplog
     ):
         factory = FakeSerial.factory(
-            chunks=[BANNER + b"\r\n"], stall_forever_after=True
+            chunks=[READING + b"\n"], stall_forever_after=True
         )
         with caplog.at_level("WARNING"):
             resets, reconnects = self.run_one_serve(monkeypatch, factory)
 
         assert resets == [("/dev/fake", True)]
-        # The reset re-enumerates the Pico, which is what the notice is for.
-        assert reconnects == 1
+        # The Pico kept running through the reset, so its run and boot-time
+        # anchor carry on. The notice would drop both.
+        assert reconnects == 0
         assert "no bytes from /dev/fake for 60s; resetting the USB device" in (
             caplog.text
         )
 
-    def test_a_port_that_never_talked_is_not_reset(self, monkeypatch):
-        # Four minutes of nothing, then the device goes away on its own.
-        factory = FakeSerial.factory(stall_forever_after=True, raise_on_read=240)
+    def test_a_pico_that_sends_no_records_is_not_reset(self, monkeypatch):
+        # An image that keeps its records off USB: boot lines, then nothing.
+        # Four minutes of that, then the device goes away on its own.
+        factory = FakeSerial.factory(
+            chunks=[BANNER + b"\r\n", b"SD card initialized\r\n"],
+            stall_forever_after=True,
+            raise_on_read=240,
+        )
         resets, _ = self.run_one_serve(monkeypatch, factory)
         assert resets == []
 
     def test_a_steady_stream_is_not_reset(self, monkeypatch):
-        # Four minutes of a line a second, well past the silence limit in total.
-        factory = FakeSerial.factory(chunks=[b"SD card initialized\r\n"] * 240)
+        # A record every five seconds for five minutes, with the empty reads
+        # between them: far past the silence limit in total, never near it at
+        # once.
+        factory = FakeSerial.factory(chunks=([READING + b"\n"] + [b""] * 4) * 60)
         resets, _ = self.run_one_serve(monkeypatch, factory)
         assert resets == []
 
