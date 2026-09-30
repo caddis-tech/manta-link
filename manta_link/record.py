@@ -162,6 +162,12 @@ BOOT_KEYS = frozenset({
     "cond_probe_k",
     "cond_tds_factor",
     "cond_outputs",
+    # Each circuit's continuous-mode setting, as the number `C,?` answers with:
+    # 0 means it speaks only when asked, which every exchange assumes, and n
+    # means it is still streaming a reading every n seconds on its own
+    # (AquadronePicoFirmware#144).
+    "ph_auto_poll_s",
+    "cond_auto_poll_s",
     "truncated",
 })
 
