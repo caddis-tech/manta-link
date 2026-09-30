@@ -12,6 +12,7 @@ can never cost a reply. No slow or failable work runs on this thread.
 """
 
 import logging
+import os
 import time
 from collections import deque
 from collections.abc import Callable
@@ -21,7 +22,7 @@ import serial
 from . import clock
 from .framing import Kind, LineAssembler, classify, parse_banner
 from .logging_setup import Throttle
-from .portfinder import BAUD, find_pico_port
+from .portfinder import BAUD, find_pico_port, usb_device_node
 
 # TIOCEXCL is Linux-only and this package is developed on Windows, so the
 # exclusion syscall is optional at import and simply absent off-platform. Only
@@ -53,11 +54,27 @@ RECONNECT_DELAY_S = 2.0
 # history Kraken caps at 3 x 20 MB, burying anything that matters.
 ABSENT_LOG_INTERVAL_S = 300.0
 
-# An open, quiet port is the correct steady state on a flight image, which makes
-# it indistinguishable in the log from a wedged one. Say so periodically rather
-# than reopening the port on a timer: a reopen landing inside the Pico's ask
-# window can eat a TIME? request.
+# Proof in the log that the reader is alive, with the byte count that shows
+# whether anything is arriving. A port that has gone silent is dealt with by
+# SILENCE_RESET_S below; this line only makes the state visible.
 ALIVE_LOG_INTERVAL_S = 600.0
+
+# How long a Pico that has been streaming records may go quiet before its USB
+# device is reset. A streaming Pico sends a record every few seconds, so sixty
+# seconds of nothing is a link that has stopped delivering, not a quiet Pico. On
+# 2026-09-22 one stopped with the port still open and no error on either side,
+# for the last 45 minutes of a run. Whatever is missed in the wait is still on
+# the Pico's card.
+SILENCE_RESET_S = 60.0
+
+# A reset that fails, or does not bring the stream back, is tried again: the
+# port it reopens has no records to arm it. At most this many in a row with no
+# record between them, so a Pico that has stopped streaming for good is then
+# left alone.
+MAX_SILENCE_RESETS = 3
+
+# From <linux/usbdevice_fs.h>: _IO('U', 20). Python's fcntl does not name it.
+USBDEVFS_RESET = 0x5514
 
 
 class SerialReader:
@@ -81,6 +98,8 @@ class SerialReader:
         self._on_banner = on_banner
         self._assembler = LineAssembler()
         self._absent_log = Throttle(ABSENT_LOG_INTERVAL_S)
+        # Silence resets since the last record.
+        self._silence_resets = 0
         self.answered_count = 0
         self.connected = False
 
@@ -98,8 +117,10 @@ class SerialReader:
                 time.sleep(RECONNECT_DELAY_S)
                 continue
 
+            reset_for_silence = False
             try:
                 self._serve(port_path)
+                reset_for_silence = True
             except Exception as exc:
                 # Broad on purpose, not a two-class tuple. termios.error is
                 # built with a NULL base in CPython, so it derives from
@@ -111,9 +132,12 @@ class SerialReader:
                 self.connected = False
                 # A reconnect means the Pico re-enumerated, so any bytes still
                 # buffered belong to a run that has ended, and so does anything
-                # derived from that run's uptime.
+                # derived from that run's uptime. Not after a silence reset:
+                # that re-enumerated a Pico that kept running, so only the
+                # partial line goes and its run carries on.
                 self._assembler.reset()
-                self._notify(self._on_reconnect, "reconnect notice")
+                if not reset_for_silence:
+                    self._notify(self._on_reconnect, "reconnect notice")
 
             time.sleep(RECONNECT_DELAY_S)
 
@@ -122,7 +146,10 @@ class SerialReader:
             log.info("no Pico (USB VID 0x2E8A) present; waiting")
 
     def _serve(self, port_path: str) -> None:
-        """Answer requests on one port until it goes away."""
+        """Answer requests on one port until it goes away or falls silent.
+
+        Raises when the port goes away. Returns only after a silence reset.
+        """
         with serial.Serial(
             port_path,
             BAUD,
@@ -144,6 +171,12 @@ class SerialReader:
 
             last_alive = time.monotonic()
             byte_count = 0
+            # Armed by the first record on this open, or from the start while
+            # retrying a reset that has not brought the stream back. Boot lines
+            # alone arm nothing, so an image that sends no records over USB is
+            # never reset.
+            armed = 0 < self._silence_resets < MAX_SILENCE_RESETS
+            last_byte_at = last_alive
 
             while True:
                 chunk = link.read(READ_SIZE)
@@ -152,13 +185,27 @@ class SerialReader:
 
                 if chunk:
                     byte_count += len(chunk)
+                    last_byte_at = now
                     for line in self._assembler.feed(chunk):
-                        self._dispatch(link, line, now)
+                        if self._dispatch(link, line, now) is Kind.RECORD:
+                            armed = True
+                            self._silence_resets = 0
+                elif armed and now - last_byte_at >= SILENCE_RESET_S:
+                    self._silence_resets += 1
+                    log.warning("no bytes from %s for %.0fs; resetting the USB "
+                                "device (%d of %d)", port_path,
+                                now - last_byte_at, self._silence_resets,
+                                MAX_SILENCE_RESETS)
+                    break
 
                 if now - last_alive >= ALIVE_LOG_INTERVAL_S:
                     log.info("still listening on %s (%d bytes, %d answered)",
                              port_path, byte_count, self.answered_count)
                     last_alive = now
+
+        # Reached only through the break above, with the port closed. The device
+        # re-enumerates, and run_forever reopens it from here.
+        reset_usb_device(port_path)
 
     def _tick(self) -> None:
         """Give the main thread its one job besides reading: watching health.
@@ -190,12 +237,13 @@ class SerialReader:
             # Not fatal. Exclusion is a guard rail, not a requirement.
             log.warning("could not claim exclusive access (%s)", exc)
 
-    def _dispatch(self, link: serial.Serial, line: bytes, received: float) -> None:
+    def _dispatch(self, link: serial.Serial, line: bytes, received: float) -> Kind:
+        """Act on one line and say what it was."""
         kind = classify(line)
 
         if kind is Kind.TIME_REQUEST:
             self._answer(link)
-            return
+            return kind
 
         if kind is Kind.RECORD:
             if self._records is not None:
@@ -203,7 +251,7 @@ class SerialReader:
                 # derives a record's absolute timestamp from an anchor and this
                 # offset, and the moment it was parsed is not that moment.
                 self._records.append((line, received))
-            return
+            return kind
 
         if kind is Kind.BANNER:
             self._notify(self._on_banner, "banner notice")
@@ -214,10 +262,11 @@ class SerialReader:
                 if "DISABLED" in state:
                     log.warning("this Pico is running a Debug image and is "
                                 "recording NOTHING to its card")
-            return
+            return kind
 
         if kind is Kind.LOG and self._logs is not None:
             self._logs.append(line)
+        return kind
 
     def _answer(self, link: serial.Serial) -> None:
         """Write the reply, or stay silent if the clock is not worth sending."""
@@ -241,3 +290,32 @@ class SerialReader:
         # the kernel has already accepted do not need draining by hand.
         self.answered_count += 1
         log.info("answered with %d", epoch_ms)
+
+
+def reset_usb_device(port_path: str) -> None:
+    """Reset the USB device behind a port: a replug, without cutting power.
+
+    The Pico keeps running and keeps recording; only its USB link starts over.
+    That clears a stall on either side without having to know which one: the
+    bus reset clears the Pico's USB state, and the kernel unbinds and rebinds
+    the serial driver, which clears ours.
+
+    Never raises. If the reset cannot be done, the port is reopened as it always
+    was before this existed.
+    """
+    # None off Linux too, which is what keeps fcntl unreached on Windows.
+    node = usb_device_node(port_path)
+    if node is None:
+        log.warning("could not find the USB device behind %s to reset it",
+                    port_path)
+        return
+    try:
+        fd = os.open(node, os.O_WRONLY)
+        try:
+            fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        log.warning("could not reset USB device %s (%s)", node, exc)
+        return
+    log.info("reset USB device %s", node)

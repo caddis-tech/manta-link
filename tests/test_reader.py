@@ -229,3 +229,141 @@ class TestDispatch:
         assert rdr.answered_count == 1
         # The Pico's own log lines still land somewhere a worker can drain.
         assert b"SD card initialized" in logs
+
+
+class _Clock:
+    """time for run_forever: a second passes per reading, and sleeps are free."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        self.now += 1.0
+        return self.now
+
+    @staticmethod
+    def sleep(_seconds: float) -> None:
+        return None
+
+
+class TestSilence:
+    """A Pico that has been streaming records and then goes quiet is reset.
+
+    On 2026-09-22 a Pico's stream stopped mid-run with the port still open and
+    no error anywhere, and nothing noticed for the last 45 minutes of the run.
+    """
+
+    @staticmethod
+    def run_serves(monkeypatch, factory, opens=1):
+        """Serve the port `opens` times, then one reconnect attempt ends it.
+
+        Every open gets the same scripted port, carrying on where the last one
+        left off. Returns the resets requested, each with whether the port was
+        already closed at the time, and how many reconnect notices were sent.
+        """
+        ports = iter(["/dev/fake"] * opens)
+
+        def next_port():
+            try:
+                return next(ports)
+            except StopIteration:
+                raise StopPlayback from None
+
+        resets = []
+        reconnects = []
+        monkeypatch.setattr(reader_mod, "time", _Clock())
+        monkeypatch.setattr(reader_mod, "find_pico_port", next_port)
+        monkeypatch.setattr(reader_mod.serial, "Serial", factory)
+        monkeypatch.setattr(
+            reader_mod,
+            "reset_usb_device",
+            lambda port: resets.append((port, factory.instance.closed)),
+        )
+
+        rdr = SerialReader(on_reconnect=lambda: reconnects.append(True))
+        with pytest.raises(StopPlayback):
+            rdr.run_forever()
+        return resets, len(reconnects)
+
+    def test_a_port_that_falls_silent_is_reset_after_it_closes(
+        self, monkeypatch, caplog
+    ):
+        factory = FakeSerial.factory(
+            chunks=[READING + b"\n"], stall_forever_after=True
+        )
+        with caplog.at_level("WARNING"):
+            resets, reconnects = self.run_serves(monkeypatch, factory)
+
+        assert resets == [("/dev/fake", True)]
+        # The Pico kept running through the reset, so its run and boot-time
+        # anchor carry on. The notice would drop both.
+        assert reconnects == 0
+        assert (
+            "no bytes from /dev/fake for 60s; resetting the USB device (1 of 3)"
+            in caplog.text
+        )
+
+    def test_a_pico_that_sends_no_records_is_not_reset(self, monkeypatch):
+        # An image that keeps its records off USB: boot lines, then nothing.
+        # Four minutes of that, then the device goes away on its own.
+        factory = FakeSerial.factory(
+            chunks=[BANNER + b"\r\n", b"SD card initialized\r\n"],
+            stall_forever_after=True,
+            raise_on_read=240,
+        )
+        resets, _ = self.run_serves(monkeypatch, factory)
+        assert resets == []
+
+    def test_a_steady_stream_is_not_reset(self, monkeypatch):
+        # A record every five seconds for five minutes, with the empty reads
+        # between them: far past the silence limit in total, never near it at
+        # once.
+        factory = FakeSerial.factory(chunks=([READING + b"\n"] + [b""] * 4) * 60)
+        resets, _ = self.run_serves(monkeypatch, factory)
+        assert resets == []
+
+    # A second passes per read: a record and 60 quiet reads to a first reset,
+    # 60 quiet reads to each retry, and four quiet minutes to show that the
+    # last open is left alone before the device goes away on its own.
+
+    def test_a_reset_that_does_not_bring_the_stream_back_is_retried(
+        self, monkeypatch
+    ):
+        most = reader_mod.MAX_SILENCE_RESETS
+        factory = FakeSerial.factory(
+            chunks=[READING + b"\n"],
+            stall_forever_after=True,
+            raise_on_read=61 + 60 * (most - 1) + 240,
+        )
+        resets, _ = self.run_serves(monkeypatch, factory, opens=most + 1)
+        assert len(resets) == most
+
+    def test_a_record_between_stalls_starts_the_count_over(self, monkeypatch):
+        # The first reset works: the reopened port streams again, then stalls
+        # again, and that stall gets the full count of resets.
+        most = reader_mod.MAX_SILENCE_RESETS
+        stall = [READING + b"\n"] + [b""] * 60
+        factory = FakeSerial.factory(
+            chunks=stall * 2,
+            stall_forever_after=True,
+            raise_on_read=61 * 2 + 60 * (most - 1) + 240,
+        )
+        resets, _ = self.run_serves(monkeypatch, factory, opens=most + 2)
+        assert len(resets) == 1 + most
+
+
+class TestResetUsbDevice:
+    """Whatever goes wrong, the reset falls back to the plain reopen."""
+
+    def test_a_device_that_cannot_be_found_is_left_alone(self, monkeypatch, caplog):
+        monkeypatch.setattr(reader_mod, "usb_device_node", lambda _port: None)
+        with caplog.at_level("WARNING"):
+            reader_mod.reset_usb_device("/dev/ttyACM0")
+        assert "could not find the USB device behind /dev/ttyACM0" in caplog.text
+
+    def test_a_reset_that_fails_does_not_raise(self, monkeypatch, caplog, tmp_path):
+        missing = str(tmp_path / "no-such-node")
+        monkeypatch.setattr(reader_mod, "usb_device_node", lambda _port: missing)
+        with caplog.at_level("WARNING"):
+            reader_mod.reset_usb_device("/dev/ttyACM0")
+        assert f"could not reset USB device {missing}" in caplog.text

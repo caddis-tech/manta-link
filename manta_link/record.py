@@ -484,7 +484,10 @@ class Anchor:
         """Called from the reader thread on every reopen. The primary rule.
 
         Any Pico reset forces a USB re-enumeration, so read-error-then-reopen is
-        the one detector that cannot be missed. The banner is not a reliable one
+        the one detector that cannot be missed. The one reopen that skips this
+        is the reader's own silence reset, which re-enumerates a Pico that kept
+        running; a reboot hidden behind one still shows as uptime going
+        backwards. The banner is not a reliable one
         on its own: the Pico prints it two seconds after boot without waiting
         for a host, and pico_stdio_usb discards output outright while DTR is
         deasserted, which is the state during the re-enumeration itself.
