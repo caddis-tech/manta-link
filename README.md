@@ -189,7 +189,7 @@ BlueOS web UI, Extensions, **Installed** tab, the **+** button, then:
 | Extension Identifier | `caddis.manta-link` |
 | Extension Name | `MANTA Link` |
 | Docker image | `ghcr.io/caddis-tech/manta-link` |
-| Docker tag | a pinned version such as `0.9.1` |
+| Docker tag | a pinned version such as `0.9.2` |
 | Custom settings | the JSON below, pasted in full |
 
 ```json
@@ -462,7 +462,7 @@ Tag it. CI runs the tests and validates the manifest against the tag before
 anything is pushed.
 
 ```bash
-git tag v0.9.1
+git tag v0.9.2
 git push --tags
 ```
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manta-link"
-version = "0.9.1"
+version = "0.9.2"
 description = "The single Pi-side process that owns the Aquadrone Pico's serial port"
 requires-python = ">=3.11"
 # Pinned exactly, including requests' own closure. The image is built for
