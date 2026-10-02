@@ -115,8 +115,15 @@ PICO_KEYS = frozenset({
     # pond: both of those arrive as a perfectly plausible number.
     "cond_fault",
     "cond_tds_sal",
+    # Each circuit's restart code and supply, on every reading since
+    # AquadronePicoFirmware@9a6a668 (first in 2.1.3) under the boot record's
+    # names. Null when the poll went unanswered.
+    "cond_restart",
+    "cond_supply_mv",
     "ph_fault",
     "ph",
+    "ph_restart",
+    "ph_supply_mv",
     "temp_fault",
     "temp_code",
     "temperature",
