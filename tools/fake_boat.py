@@ -434,28 +434,38 @@ class Pico:
         self.answered = threading.Event()
 
     def run_forever(self) -> None:
+        """Boot, then send a reading every cadence, asking for the time once a
+        second until MANTA Link answers or the boot window closes. As on the
+        firmware, readings go out while it asks, unstamped until an answer
+        arrives, and never stamped if none does."""
         booted = time.monotonic()
         self._send(BANNER.encode("ascii"))
-        epoch_at_boot_ms = self._ask_for_time(booted)
-        while not self.stopped.wait(self._cadence_s):
-            uptime_ms = int((time.monotonic() - booted) * 1000)
-            epoch_ms = (
-                None if epoch_at_boot_ms is None else epoch_at_boot_ms + uptime_ms
-            )
-            self._water.step()
-            self._send(reading_line(uptime_ms, epoch_ms, self._water))
-
-    def _ask_for_time(self, booted: float) -> "int | None":
-        """The epoch at boot, from MANTA Link's answer, or None when it stays
-        silent, in which case every record carries a null epoch_ms, as the
-        firmware's own would."""
-        while time.monotonic() - booted < TIME_WINDOW_S and not self.stopped.is_set():
-            self._send(b"TIME?")
-            replied = self._reply_within(TIME_ASK_INTERVAL_S)
+        epoch_at_boot_ms: int | None = None
+        next_reading = booted + self._cadence_s
+        next_ask = booted
+        while not self.stopped.is_set():
+            now = time.monotonic()
+            asking = epoch_at_boot_ms is None and now - booted < TIME_WINDOW_S
+            if asking and now >= next_ask:
+                self._send(b"TIME?")
+                next_ask = now + TIME_ASK_INTERVAL_S
+            if now >= next_reading:
+                uptime_ms = int((now - booted) * 1000)
+                epoch_ms = (
+                    None if epoch_at_boot_ms is None else epoch_at_boot_ms + uptime_ms
+                )
+                self._water.step()
+                self._send(reading_line(uptime_ms, epoch_ms, self._water))
+                next_reading += self._cadence_s
+            wake = min(next_reading, next_ask) if asking else next_reading
+            wait_s = max(0.0, wake - time.monotonic())
+            if not asking:
+                self.stopped.wait(wait_s)
+                continue
+            replied = self._reply_within(wait_s)
             if replied is not None:
+                epoch_at_boot_ms = replied - int((time.monotonic() - booted) * 1000)
                 self.answered.set()
-                return replied - int((time.monotonic() - booted) * 1000)
-        return None
 
     def _reply_within(self, timeout_s: float) -> "int | None":
         deadline = time.monotonic() + timeout_s

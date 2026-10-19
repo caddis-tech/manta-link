@@ -368,9 +368,26 @@ def test_the_real_reader_answers_the_fake_pico_and_takes_its_readings(monkeypatc
     is answered, and what follows arrives as stamped records."""
     pico = fake_boat.Pico(cadence_s=0.05)
 
+    def stamped():
+        epochs = [json.loads(line)["epoch_ms"] for line, _ in list(records)]
+        return [epoch for epoch in epochs if epoch is not None]
+
     with _reading(pico, monkeypatch, answering=True) as records:
-        _until(lambda: pico.answered.is_set() and len(records) >= 3)
+        _until(lambda: len(stamped()) >= 2)
 
     assert pico.answered.is_set()
-    stamped = json.loads(records[-1][0])
-    assert abs(stamped["epoch_ms"] - time.time() * 1000) < 60_000
+    assert abs(stamped()[-1] - time.time() * 1000) < 60_000
+
+
+@pytest.mark.skipif(not hasattr(os, "openpty"), reason="pseudo-terminals are Unix only")
+def test_readings_flow_unstamped_while_the_time_goes_unanswered(monkeypatch):
+    """The firmware records while it asks. A fake that waited out the whole
+    window first would hide the unstamped stretch MANTA Link's anchoring is for."""
+    pico = fake_boat.Pico(cadence_s=0.05)
+
+    with _reading(pico, monkeypatch, answering=False) as records:
+        _until(lambda: len(records) >= 3, seconds=5)
+
+    assert not pico.answered.is_set()
+    assert len(records) >= 3
+    assert all(json.loads(line)["epoch_ms"] is None for line, _ in records)
