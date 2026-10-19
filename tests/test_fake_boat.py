@@ -67,6 +67,17 @@ def test_the_pond_pages_download_is_read_as_lat_lng():
     assert ring[-1] == POND[0]
 
 
+@pytest.mark.parametrize("geojson", [
+    [[-82.9975, 39.9350], [-82.9965, 39.9350], [-82.9965, 39.9355]],
+    7,
+    {"type": "Feature", "geometry": [1, 2]},
+    {"type": "MultiPolygon", "coordinates": []},
+])
+def test_anything_but_a_polygon_is_refused_with_what_it_was(geojson):
+    with pytest.raises(ValueError, match="expected a GeoJSON Polygon"):
+        fake_boat.pond_ring(geojson)
+
+
 def test_every_waypoint_is_inside_the_pond_and_the_lanes_cover_it():
     """caddis-api files a reading under a pond only when it is inside the ring."""
     path = fake_boat.survey_lanes(POND)

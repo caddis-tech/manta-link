@@ -143,12 +143,13 @@ def pond_ring(geojson: dict[str, Any]) -> list[tuple[float, float]]:
     """A pond's outer ring as (lat, lng), from a Polygon, Feature or the
     FeatureCollection the pond page's Download GeoJSON serves."""
     shape = geojson
-    if shape.get("type") == "FeatureCollection":
+    if isinstance(shape, dict) and shape.get("type") == "FeatureCollection":
         shape = shape["features"][0]
-    if shape.get("type") == "Feature":
+    if isinstance(shape, dict) and shape.get("type") == "Feature":
         shape = shape["geometry"]
-    if shape.get("type") != "Polygon":
-        raise ValueError(f"expected a Polygon, got {shape.get('type')!r}")
+    if not isinstance(shape, dict) or shape.get("type") != "Polygon":
+        found = shape.get("type") if isinstance(shape, dict) else type(shape).__name__
+        raise ValueError(f"expected a GeoJSON Polygon, got {found!r}")
     return [(lat, lng) for lng, lat, *_ in shape["coordinates"][0]]
 
 
