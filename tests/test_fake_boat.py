@@ -1,0 +1,270 @@
+"""The fake boat feeds MANTA Link what a boat would, and none of it reaches production.
+
+A development tool, tested for the two ways it could mislead. A reading or a
+position MANTA Link reads differently from a real one would make a run against
+staging prove less than it seems to. An upload that escapes to production would
+file a made-up reading against a real pond as if a drone had measured it.
+"""
+
+import json
+import os
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from manta_link import clock, config, framing, gps, mavlink2rest, reader, record  # noqa: E402
+from manta_link.reader import SerialReader  # noqa: E402
+from tools import fake_boat  # noqa: E402
+
+from .golden import READING  # noqa: E402
+
+STAGING = "https://squadron-staging-928515830511.us-central1.run.app"
+
+# About 85 m by 55 m, beside the bench rig's own captured fix, as (lat, lng).
+POND = [
+    (39.9350, -82.9975), (39.9350, -82.9965), (39.9355, -82.9965), (39.9355, -82.9975)
+]
+
+
+def _download(ring):
+    """The pond as caddis-api's Download GeoJSON writes it: lng first, closed."""
+    coordinates = [[lng, lat] for lat, lng in ring] + [[ring[0][1], ring[0][0]]]
+    return {"type": "FeatureCollection", "features": [{
+        "type": "Feature", "properties": {"name": "Bench pond"},
+        "geometry": {"type": "Polygon", "coordinates": [coordinates]},
+    }]}
+
+
+class Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.fixture
+def confined(monkeypatch):
+    """confine_uploads rebinds module state; put it back after each test."""
+    monkeypatch.setattr(config, "DEFAULT_API_URL", config.DEFAULT_API_URL)
+    monkeypatch.setattr(config.Config, "batch_endpoint", config.Config.batch_endpoint)
+    monkeypatch.delenv(config.API_URL_ENV, raising=False)
+
+
+# --- the pond ------------------------------------------------------------------
+
+
+def test_the_pond_pages_download_is_read_as_lat_lng():
+    ring = fake_boat.pond_ring(_download(POND))
+
+    assert ring[:-1] == POND
+    assert ring[-1] == POND[0]
+
+
+def test_every_waypoint_is_inside_the_pond_and_the_lanes_cover_it():
+    """caddis-api files a reading under a pond only when it is inside the ring."""
+    path = fake_boat.survey_lanes(POND)
+
+    assert all(fake_boat.inside(point, POND) for point in path)
+    assert len({lat for lat, _ in path}) >= 5
+
+
+def test_a_concave_pond_keeps_the_walk_off_the_land_in_its_bay():
+    """An L-shaped pond: the lanes stop where the water does."""
+    ell = [(39.9350, -82.9975), (39.9350, -82.9965), (39.9352, -82.9965),
+           (39.9352, -82.9970), (39.9355, -82.9970), (39.9355, -82.9975)]
+
+    path = fake_boat.survey_lanes(ell)
+
+    assert path
+    assert all(fake_boat.inside(point, ell) for point in path)
+    assert not any(lat > 39.9352 and lng > -82.9970 for lat, lng in path)
+
+
+def test_a_pond_too_small_for_a_lane_is_refused_with_the_reason():
+    speck = [(39.93500, -82.99700), (39.93500, -82.99699), (39.93501, -82.99699)]
+
+    with pytest.raises(ValueError, match="no lane crosses the pond"):
+        fake_boat.survey_lanes(speck)
+
+
+# --- the Pico ------------------------------------------------------------------
+
+
+def _fake_reading():
+    return fake_boat.reading_line(72_000, 1_754_400_072_000, fake_boat.Water(seed=1))
+
+
+def test_a_fake_reading_carries_the_golden_readings_fields_and_no_others():
+    """The golden line is the firmware's own writer; a key it lacks is a shape
+    MANTA Link would log as unknown on a boat."""
+    fake = json.loads(_fake_reading())
+
+    assert set(fake) == set(json.loads(READING)) | {"ms_since_boot"}
+    assert record.unknown_keys(fake) == []
+    assert framing.classify(_fake_reading()) is framing.Kind.RECORD
+
+
+def test_every_measurement_on_a_fake_reading_maps_to_a_number():
+    payload = record.to_payload(json.loads(_fake_reading()))
+
+    for key in ("conductivity", "tds", "salinity", "ph", "water_temperature"):
+        assert isinstance(payload[key], int | float), key
+    assert "ph_raw" not in payload
+
+
+def test_the_water_drifts_inside_what_caddis_api_draws():
+    water = fake_boat.Water(seed=7)
+
+    for _ in range(2000):
+        water.step()
+        assert 6.9 <= water.ph <= 7.8
+        assert 380 <= water.conductivity <= 480
+        assert 16 <= water.temperature <= 20
+
+
+# --- the autopilot -------------------------------------------------------------
+
+
+@pytest.fixture
+def autopilot():
+    now = Clock()
+    server = fake_boat.serve_autopilot(
+        fake_boat.Autopilot(fake_boat.survey_lanes(POND), now=now)
+    )
+    link = mavlink2rest.Mavlink2Rest(f"http://127.0.0.1:{server.server_port}")
+    yield link, now
+    server.shutdown()
+    server.server_close()
+
+
+def test_the_autopilot_is_read_as_a_3d_fix_inside_the_pond(autopilot):
+    link, _ = autopilot
+
+    position = link.message(gps.POSITION_MESSAGE)
+    quality = link.message(gps.QUALITY_MESSAGE)
+
+    assert position.outcome is mavlink2rest.Outcome.OBSERVED
+    where = gps.read_coordinates(dict(position.observation.fields))
+    assert fake_boat.inside(where, POND)
+    assert gps.read_fix_type(dict(quality.observation.fields)).usable
+    assert gps.read_hdop(dict(quality.observation.fields)) == 1.45
+
+
+def test_the_autopilot_keeps_talking_and_the_boat_keeps_moving(autopilot):
+    """mavlink2rest serves its last message for ever, so an unchanged counter
+    reads as an autopilot that has stopped."""
+    link, now = autopilot
+    before = link.message(gps.POSITION_MESSAGE).observation
+
+    now.now += 5.0
+    after = link.message(gps.POSITION_MESSAGE).observation
+
+    assert after.counter != before.counter
+    assert gps.read_coordinates(dict(after.fields)) != gps.read_coordinates(
+        dict(before.fields)
+    )
+
+
+def test_a_message_the_autopilot_does_not_send_is_absent(autopilot):
+    link, _ = autopilot
+
+    assert link.message("SYS_STATUS").outcome is mavlink2rest.Outcome.ABSENT
+
+
+# --- never production ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.caddistech.com",
+    "https://API.caddistech.com/",
+    "https://squadron.caddistech.com",
+    "https://django-backend-172019847409.us-central1.run.app",
+])
+def test_production_is_refused_by_name(url):
+    assert fake_boat.is_production(url)
+
+
+@pytest.mark.parametrize("url", [STAGING, "http://127.0.0.1:8000", "http://localhost:8000"])
+def test_staging_and_a_bench_api_are_not_production(url):
+    assert not fake_boat.is_production(url)
+
+
+def test_uploads_go_to_the_named_api_and_nowhere_else(confined):
+    fake_boat.confine_uploads(STAGING)
+
+    named = config.Config(api_url=STAGING).batch_endpoint
+    elsewhere = [
+        config.Config(api_url="https://api.caddistech.com").batch_endpoint,
+        config.Config(api_url="https://example.org").batch_endpoint,
+        config.Config().batch_endpoint,
+    ]
+
+    assert named == f"{STAGING}/api/v1/devices/telemetry/batch/"
+    assert all(url.startswith(fake_boat.REFUSED_API_URL) for url in elsewhere)
+
+
+@pytest.mark.parametrize("written", [None, "http://10.0.0.5:8000", "https://user:pw@x.org"])
+def test_a_missing_or_refused_url_resolves_to_nowhere_not_production(
+    confined, tmp_path, written
+):
+    """MANTA Link's own answer to both is production, which is right for a boat
+    and the one place a fake one must never post."""
+    if written is not None:
+        (tmp_path / config.ENV_FILENAME).write_text(f"{config.API_URL_ENV}={written}\n")
+    fake_boat.confine_uploads(STAGING)
+    watcher = config.ConfigWatcher(tmp_path, config.TokenSession())
+
+    watcher.reload()
+
+    assert watcher.config.batch_endpoint.startswith(fake_boat.REFUSED_API_URL)
+
+
+@pytest.mark.parametrize("argv", [
+    ["--api-url", "https://api.caddistech.com"],
+    [],
+])
+def test_production_or_no_api_at_all_stops_it_before_the_port_is_touched(
+    confined, monkeypatch, tmp_path, argv
+):
+    pond = tmp_path / "pond.geojson"
+    pond.write_text(json.dumps(_download(POND)))
+    untouched = reader.find_pico_port
+
+    assert fake_boat.main([str(pond), *argv]) == 2
+    assert reader.find_pico_port is untouched
+
+
+# --- against the real reader ---------------------------------------------------
+
+
+@pytest.mark.skipif(not hasattr(os, "openpty"), reason="pseudo-terminals are Unix only")
+def test_the_real_reader_answers_the_fake_pico_and_takes_its_readings(monkeypatch):
+    """The fake end to end on MANTA Link's side of the port: the time asked for
+    is answered, and what follows arrives as stamped records."""
+    pico = fake_boat.Pico(cadence_s=0.05)
+    monkeypatch.setattr(reader, "find_pico_port", lambda: pico.port)
+    monkeypatch.setattr(clock, "clock_is_trustworthy", lambda: True)
+    records: deque = deque()
+    port_owner = SerialReader(records=records)
+    threading.Thread(target=port_owner.run_forever, daemon=True).start()
+    talking = threading.Thread(target=pico.run_forever, daemon=True)
+    talking.start()
+
+    deadline = time.monotonic() + 10
+    while len(records) < 2 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    pico.stopped.set()
+    talking.join(timeout=5)
+    pico.close()
+
+    assert pico.answered.is_set()
+    assert len(records) >= 2
+    stamped = json.loads(records[-1][0])
+    assert abs(stamped["epoch_ms"] - time.time() * 1000) < 60_000
