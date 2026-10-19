@@ -7,6 +7,7 @@ file a made-up reading against a real pond as if a drone had measured it.
 """
 
 import json
+import math
 import os
 import sys
 import threading
@@ -96,6 +97,23 @@ def test_a_concave_pond_keeps_the_walk_off_the_land_in_its_bay():
     assert path
     assert all(fake_boat.inside(point, ell) for point in path)
     assert not any(lat > 39.9352 and lng > -82.9970 for lat, lng in path)
+
+
+def test_a_large_finely_traced_lake_is_laned_without_testing_every_point():
+    """A 2 km lake traced with 500 vertices: each lane meets the ring once, so
+    this is lanes times edges, not lanes times metres times edges."""
+    lake = [
+        (39.93 + 0.0045 * math.sin(2 * math.pi * i / 500),
+         -82.99 + 0.0117 * math.cos(2 * math.pi * i / 500))
+        for i in range(500)
+    ]
+
+    started = time.monotonic()
+    path = fake_boat.survey_lanes(lake)
+
+    assert time.monotonic() - started < 5
+    assert len(path) > 100_000
+    assert all(fake_boat.inside(point, lake) for point in path[::997])
 
 
 def test_a_pond_too_small_for_a_lane_is_refused_with_the_reason():

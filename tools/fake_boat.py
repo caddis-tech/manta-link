@@ -153,16 +153,21 @@ def pond_ring(geojson: dict[str, Any]) -> list[tuple[float, float]]:
     return [(lat, lng) for lng, lat, *_ in shape["coordinates"][0]]
 
 
-def inside(point: tuple[float, float], ring: list[tuple[float, float]]) -> bool:
-    """Whether `point` is inside `ring`, by counting edge crossings."""
-    lat, lng = point
-    crossings = False
+def _crossings(lat: float, ring: list[tuple[float, float]]) -> list[float]:
+    """The longitudes, west to east, where a line of latitude `lat` crosses
+    `ring`. Each edge counts on its lower end and not its upper one, so a
+    vertex on the line is crossed once and a flat edge not at all."""
+    found = []
     for (lat_a, lng_a), (lat_b, lng_b) in zip(ring, ring[1:] + ring[:1], strict=True):
         if (lat_a > lat) != (lat_b > lat):
-            lng_at = lng_a + (lat - lat_a) * (lng_b - lng_a) / (lat_b - lat_a)
-            if lng < lng_at:
-                crossings = not crossings
-    return crossings
+            found.append(lng_a + (lat - lat_a) * (lng_b - lng_a) / (lat_b - lat_a))
+    return sorted(found)
+
+
+def inside(point: tuple[float, float], ring: list[tuple[float, float]]) -> bool:
+    """Whether `point` is inside `ring`: an odd number of crossings east of it."""
+    lat, lng = point
+    return sum(1 for crossing in _crossings(lat, ring) if lng < crossing) % 2 == 1
 
 
 def survey_lanes(
@@ -187,9 +192,17 @@ def survey_lanes(
     lat = min(lats) + lane_step / 2
     eastward = True
     while lat < max(lats):
-        samples = int((max(lngs) - min(lngs)) / sample_step) + 1
-        lane = [(lat, min(lngs) + i * sample_step) for i in range(samples)]
-        lane = [point for point in lane if inside(point, ring)]
+        # Pairs of crossings bound the water along this lane, so samples are
+        # taken between them rather than tested one by one against the ring.
+        # On the same grid from the west edge, so every lane lines up.
+        lane = []
+        crossings = _crossings(lat, ring)
+        for west, east in zip(crossings[::2], crossings[1::2], strict=True):
+            first = math.floor((west - min(lngs)) / sample_step) + 1
+            lng = min(lngs) + first * sample_step
+            while lng < east:
+                lane.append((lat, lng))
+                lng += sample_step
         path.extend(lane if eastward else reversed(lane))
         eastward = not eastward
         lat += lane_step
