@@ -70,8 +70,11 @@ REFUSED_API_URL = "https://refused-by-fake-boat.invalid"
 REFUSAL_LOG_INTERVAL_S = 60.0
 
 # A record every few seconds, as a streaming Pico sends them, and the window
-# after boot in which the firmware asks for the time (see reader.py).
+# after boot in which the firmware asks for the time (see reader.py). Below the
+# floor a typo floods whichever API this points at: nothing in a fake Pico
+# takes time to measure, and MANTA Link uploads as fast as it is fed.
 CADENCE_S = 4.0
+MIN_CADENCE_S = 1.0
 TIME_ASK_INTERVAL_S = 1.0
 TIME_WINDOW_S = 180.0
 FIRMWARE_VERSION = "2.1.2+fake-boat"
@@ -412,6 +415,15 @@ class Pico:
 # --- running it ----------------------------------------------------------------
 
 
+def _cadence(text: str) -> float:
+    value = float(text)
+    if not (math.isfinite(value) and value >= MIN_CADENCE_S):
+        raise argparse.ArgumentTypeError(
+            f"must be at least {MIN_CADENCE_S:g} s, not {text}"
+        )
+    return value
+
+
 def parse_args(argv: "list[str] | None") -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="fake_boat",
@@ -424,8 +436,11 @@ def parse_args(argv: "list[str] | None") -> argparse.Namespace:
         "--api-url", default=os.environ.get(config.API_URL_ENV),
         help=f"the caddis-api to post to; default ${config.API_URL_ENV}",
     )
-    parser.add_argument("--cadence", type=float, default=CADENCE_S,
-                        help=f"seconds between readings, default {CADENCE_S:g}")
+    parser.add_argument(
+        "--cadence", type=_cadence, default=CADENCE_S,
+        help=f"seconds between readings, default {CADENCE_S:g}, "
+             f"at least {MIN_CADENCE_S:g}",
+    )
     return parser.parse_args(argv)
 
 

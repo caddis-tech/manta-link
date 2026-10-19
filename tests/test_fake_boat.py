@@ -259,6 +259,19 @@ def test_production_or_no_api_at_all_stops_it_before_the_port_is_touched(
     assert reader.find_pico_port is untouched
 
 
+@pytest.mark.parametrize("cadence", ["0", "-4", "0.004", "nan", "inf"])
+def test_a_cadence_that_would_flood_the_api_is_refused(confined, tmp_path, cadence):
+    """Nothing in a fake Pico takes time to measure, so a zero here would post
+    readings as fast as MANTA Link can upload them."""
+    pond = tmp_path / "pond.geojson"
+    pond.write_text(json.dumps(_download(POND)))
+    untouched = reader.find_pico_port
+
+    with pytest.raises(SystemExit):
+        fake_boat.main([str(pond), "--api-url", STAGING, "--cadence", cadence])
+    assert reader.find_pico_port is untouched
+
+
 # --- against the real reader ---------------------------------------------------
 
 
