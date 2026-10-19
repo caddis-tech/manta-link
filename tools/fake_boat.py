@@ -120,6 +120,8 @@ def confine_uploads(api_url: str) -> None:
     Rebound on the module and the class rather than passed in, as bench_host
     rebinds the clock: config.py is the one place an upload's address is
     decided, and the package should not grow a seam that exists only for this.
+    The fallback rebinding stops being needed for refused URLs once the
+    package stops failing open (caddis-tech/manta-link#31).
     """
     allowed = _origin(api_url)
     shipped = config.Config.batch_endpoint.fget
