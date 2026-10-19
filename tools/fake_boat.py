@@ -55,12 +55,13 @@ from tools import bench_host  # noqa: E402
 
 log = logging.getLogger("manta_link.fake_boat")
 
-# Production's names. Anything under the company domain, and the Cloud Run
-# service's own address, which answers without it.
+# Production's names: anything under the company domain, and its Cloud Run
+# service under every address Cloud Run gives it, which answer without that
+# domain: the project-number URL, a revision tag's ("<tag>---<service>-..."),
+# and the older hashed form ("<service>-<hash>-uc.a.run.app").
 PRODUCTION_DOMAIN = "caddistech.com"
-PRODUCTION_RUN_APP_HOSTS = frozenset({
-    "django-backend-172019847409.us-central1.run.app",
-})
+PRODUCTION_PROJECT_NUMBER = "172019847409"
+PRODUCTION_SERVICE = "django-backend"
 
 # Where an upload goes when its URL is not the one named on the command line.
 # .invalid is reserved never to resolve (RFC 2606), so it fails before a byte
@@ -88,18 +89,26 @@ METRES_PER_DEGREE_LAT = 111_320.0
 # --- never production ----------------------------------------------------------
 
 
+def _host(url: str) -> str:
+    # A trailing dot is the same host to DNS and a different string to a
+    # comparison, so it is dropped before either check sees the name.
+    return (urlsplit(url.strip()).hostname or "").lower().rstrip(".")
+
+
 def is_production(url: str) -> bool:
-    host = (urlsplit(url).hostname or "").lower()
-    return (
-        host == PRODUCTION_DOMAIN
-        or host.endswith("." + PRODUCTION_DOMAIN)
-        or host in PRODUCTION_RUN_APP_HOSTS
+    host = _host(url)
+    if host == PRODUCTION_DOMAIN or host.endswith("." + PRODUCTION_DOMAIN):
+        return True
+    if not host.endswith(".run.app"):
+        return False
+    service = host.split("---")[-1]
+    return PRODUCTION_PROJECT_NUMBER in host or service.startswith(
+        PRODUCTION_SERVICE + "-"
     )
 
 
 def _origin(url: str) -> tuple[str, str, int | None]:
-    parts = urlsplit(url.strip())
-    return parts.scheme, (parts.hostname or "").lower(), parts.port
+    return urlsplit(url.strip()).scheme, _host(url), urlsplit(url.strip()).port
 
 
 def confine_uploads(api_url: str) -> None:

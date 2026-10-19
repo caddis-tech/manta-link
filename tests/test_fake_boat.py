@@ -191,6 +191,24 @@ def test_production_is_refused_by_name(url):
     assert fake_boat.is_production(url)
 
 
+@pytest.mark.parametrize("url", [
+    "https://api.caddistech.com.",
+    "https://Squadron.CaddisTech.com./pond_status/",
+    "https://canary---django-backend-172019847409.us-central1.run.app",
+    "https://django-backend-a1b2c3d4e5-uc.a.run.app",
+])
+def test_production_is_refused_under_every_other_name_dns_answers_to(url):
+    """A trailing dot is the same host to DNS, and Cloud Run serves the one
+    service at a revision tag's address and at its older hashed one too."""
+    assert fake_boat.is_production(url)
+
+
+def test_uploads_named_with_a_trailing_dot_are_still_confined(confined):
+    fake_boat.confine_uploads(STAGING)
+
+    assert config.Config(api_url=STAGING + ".").batch_endpoint.startswith(STAGING)
+
+
 @pytest.mark.parametrize("url", [STAGING, "http://127.0.0.1:8000", "http://localhost:8000"])
 def test_staging_and_a_bench_api_are_not_production(url):
     assert not fake_boat.is_production(url)

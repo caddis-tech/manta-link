@@ -505,6 +505,6 @@ only on loopback.
 
 It refuses production. Its readings would be filed against a real pond as if a
 drone had measured them, so it will not start against a `caddistech.com` host or
-production's Cloud Run address, and it confines uploads to the one API it was
+any address Cloud Run gives the production service, and it confines uploads to the one API it was
 given: the production fallback this process uses for an unset or refused URL is
 replaced with one that cannot resolve.
