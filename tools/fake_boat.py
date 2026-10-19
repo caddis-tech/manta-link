@@ -522,6 +522,25 @@ def parse_args(argv: "list[str] | None") -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _what_would_stop_uploads(api_url: str) -> "str | None":
+    """Why MANTA Link would not upload to `api_url`, asked the way it will ask.
+
+    The data volume's .env wins over the environment, so a reused boat folder
+    naming another API would have every upload refused while the start-up
+    line named this one.
+    """
+    watcher = config.ConfigWatcher(entry.data_volume(), config.TokenSession())
+    watcher.reload()
+    resolved = watcher.config
+    if _origin(resolved.api_url) != _origin(api_url):
+        return (f"{watcher.path} names another API, which wins over --api-url; "
+                "remove it or point it at the same one")
+    if not resolved.configured:
+        return (f"no {config.TOKEN_ENV} in the environment or {watcher.path}, "
+                "so nothing would upload")
+    return None
+
+
 def main(argv: "list[str] | None" = None) -> int:
     args = parse_args(argv)
     if not args.api_url:
@@ -540,6 +559,10 @@ def main(argv: "list[str] | None" = None) -> int:
 
     os.environ[config.API_URL_ENV] = args.api_url
     confine_uploads(args.api_url)
+    problem = _what_would_stop_uploads(args.api_url)
+    if problem:
+        print(f"fake boat: {problem}", file=sys.stderr)
+        return 2
     server = serve_autopilot(Autopilot(walk))
     os.environ[entry.MAVLINK2REST_URL_ENV] = f"http://127.0.0.1:{server.server_port}"
     pico = Pico(cadence_s=args.cadence)

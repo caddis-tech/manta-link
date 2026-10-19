@@ -310,6 +310,34 @@ def test_production_or_no_api_at_all_stops_it_before_the_port_is_touched(
     assert reader.find_pico_port is untouched
 
 
+@pytest.mark.parametrize("env_file, token, says", [
+    (f"{config.TOKEN_ENV}=t\n{config.API_URL_ENV}=https://example.org\n", None,
+     "names another API"),
+    (f"{config.API_URL_ENV}=http://10.0.0.5:8000\n", "t", "names another API"),
+    ("", None, "nothing would upload"),
+])
+def test_it_will_not_start_when_manta_link_would_not_upload_where_it_says(
+    confined, monkeypatch, tmp_path, capsys, env_file, token, says
+):
+    """The start-up line names the API it uploads to, so it must be the one
+    MANTA Link resolves: the data volume's .env wins over the environment."""
+    pond = tmp_path / "pond.geojson"
+    pond.write_text(json.dumps(_download(POND)))
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / config.ENV_FILENAME).write_text(env_file)
+    monkeypatch.setenv("AQUADRONE_DATA_DIR", str(data))
+    if token is None:
+        monkeypatch.delenv(config.TOKEN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(config.TOKEN_ENV, token)
+    untouched = reader.find_pico_port
+
+    assert fake_boat.main([str(pond), "--api-url", STAGING]) == 2
+    assert says in capsys.readouterr().err
+    assert reader.find_pico_port is untouched
+
+
 @pytest.mark.parametrize("cadence", ["0", "-4", "0.004", "nan", "inf"])
 def test_a_cadence_that_would_flood_the_api_is_refused(confined, tmp_path, cadence):
     """Nothing in a fake Pico takes time to measure, so a zero here would post
