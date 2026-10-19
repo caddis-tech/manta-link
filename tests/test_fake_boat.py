@@ -116,6 +116,28 @@ def test_a_large_finely_traced_lake_is_laned_without_testing_every_point():
     assert all(fake_boat.inside(point, lake) for point in path[::997])
 
 
+def _metres(a, b):
+    degree = fake_boat.METRES_PER_DEGREE_LAT
+    north = (a[0] - b[0]) * degree
+    east = (a[1] - b[1]) * degree * math.cos(math.radians(a[0]))
+    return math.hypot(north, east)
+
+
+def test_each_pass_lies_between_the_last_and_starts_where_it_ended():
+    """A pass that retraces the last lands every new reading on an old ring, so
+    a viewer cannot see them arrive, and a wrap to the first lane is a jump
+    across the pond that caddis-api scores as travel."""
+    walk = fake_boat.Walk(POND)
+    first = [walk.at(i) for i in range(walk.first_pass)]
+    later = [walk.at(walk.first_pass + i) for i in range(3 * walk.first_pass)]
+
+    assert not set(first) & set(later)
+    assert all(fake_boat.inside(point, POND) for point in later)
+    track = first + later
+    steps = [_metres(a, b) for a, b in zip(track, track[1:], strict=False)]
+    assert max(steps) < 2 * fake_boat.LANE_SPACING_M
+
+
 def test_a_pond_too_small_for_a_lane_is_refused_with_the_reason():
     speck = [(39.93500, -82.99700), (39.93500, -82.99699), (39.93501, -82.99699)]
 
@@ -164,9 +186,8 @@ def test_the_water_drifts_inside_what_caddis_api_draws():
 @pytest.fixture
 def autopilot():
     now = Clock()
-    server = fake_boat.serve_autopilot(
-        fake_boat.Autopilot(fake_boat.survey_lanes(POND), now=now)
-    )
+    walk = fake_boat.Walk(POND)
+    server = fake_boat.serve_autopilot(fake_boat.Autopilot(walk, now=now))
     link = mavlink2rest.Mavlink2Rest(f"http://127.0.0.1:{server.server_port}")
     yield link, now
     server.shutdown()

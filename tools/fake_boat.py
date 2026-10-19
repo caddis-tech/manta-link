@@ -174,11 +174,18 @@ def survey_lanes(
     ring: list[tuple[float, float]],
     spacing_m: float = LANE_SPACING_M,
     step_m: float = STEP_M,
+    *,
+    offset: float = 0.5,
+    northward: bool = True,
+    from_east: bool = False,
 ) -> list[tuple[float, float]]:
     """Waypoints working east and west across the pond, a lane at a time.
 
-    Every one is inside the ring, because caddis-api files a reading under a
-    pond only when its position is, since its strict geofence containment.
+    The first lane is `offset` of a spacing in from the south edge, or the
+    north edge when not `northward`, and runs west from the east side when
+    `from_east`. Every waypoint is inside the ring, because caddis-api files a
+    reading under a pond only when its position is, since its strict geofence
+    containment.
     """
     lats = [lat for lat, _ in ring]
     lngs = [lng for _, lng in ring]
@@ -187,11 +194,12 @@ def survey_lanes(
     )
     lane_step = spacing_m / METRES_PER_DEGREE_LAT
     sample_step = step_m / metres_per_degree_lng
+    heading = 1 if northward else -1
 
     path: list[tuple[float, float]] = []
-    lat = min(lats) + lane_step / 2
-    eastward = True
-    while lat < max(lats):
+    lat = (min(lats) if northward else max(lats)) + heading * offset * lane_step
+    eastward = not from_east
+    while min(lats) < lat < max(lats):
         # Pairs of crossings bound the water along this lane, so samples are
         # taken between them rather than tested one by one against the ring.
         # On the same grid from the west edge, so every lane lines up.
@@ -205,12 +213,58 @@ def survey_lanes(
                 lng += sample_step
         path.extend(lane if eastward else reversed(lane))
         eastward = not eastward
-        lat += lane_step
+        lat += heading * lane_step
     if not path:
         raise ValueError(
             "no lane crosses the pond; is its outline only a few metres across?"
         )
     return path
+
+
+# Each pass's lanes are shifted from the last by the golden ratio's fraction of
+# a spacing, so no pass lies on another however long the boat runs, and a new
+# reading lands between old ones rather than on top of one.
+PASS_SHIFT = (math.sqrt(5) - 1) / 2
+
+
+class Walk:
+    """Where the boat is after a number of waypoints: the pond worked pass after
+    pass, each starting from the corner the last one finished in, so the track
+    never jumps back across the water."""
+
+    def __init__(self, ring: list[tuple[float, float]]) -> None:
+        self._ring = ring
+        self._middle = (
+            sum(lat for lat, _ in ring) / len(ring),
+            sum(lng for _, lng in ring) / len(ring),
+        )
+        self._pass = 0
+        self._start = 0
+        self._path = survey_lanes(ring)
+        self.first_pass = len(self._path)
+
+    def at(self, index: int) -> tuple[float, float]:
+        """The waypoint `index` steps from the start. Only ever asked for
+        further along, since the autopilot's clock only moves forward."""
+        while index >= self._start + len(self._path):
+            self._start += len(self._path)
+            self._pass += 1
+            self._path = self._next_pass()
+        return self._path[max(0, index - self._start)]
+
+    def _next_pass(self) -> list[tuple[float, float]]:
+        end_lat, end_lng = self._path[-1]
+        try:
+            return survey_lanes(
+                self._ring,
+                offset=(0.5 + self._pass * PASS_SHIFT) % 1,
+                northward=end_lat < self._middle[0],
+                from_east=end_lng > self._middle[1],
+            )
+        except ValueError:
+            # A pond a lane or two across can have no water at some shift.
+            # Retracing the last pass is still a track a boat could drive.
+            return list(reversed(self._path))
 
 
 # --- the autopilot -------------------------------------------------------------
@@ -231,11 +285,11 @@ class Autopilot:
 
     def __init__(
         self,
-        path: list[tuple[float, float]],
+        walk: Walk,
         now: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
     ) -> None:
-        self._path = path
+        self._walk = walk
         self._now = now
         self._wall = wall
         self._started = now()
@@ -243,7 +297,7 @@ class Autopilot:
 
     def position(self) -> tuple[float, float]:
         travelled = (self._now() - self._started) * SPEED_M_S
-        return self._path[int(travelled / STEP_M) % len(self._path)]
+        return self._walk.at(int(travelled / STEP_M))
 
     def message(self, name: str) -> "dict[str, Any] | None":
         lat, lng = self.position()
@@ -469,14 +523,14 @@ def main(argv: "list[str] | None" = None) -> int:
               "fake readings never go there", file=sys.stderr)
         return 2
     try:
-        path = survey_lanes(pond_ring(json.loads(args.pond.read_text())))
+        walk = Walk(pond_ring(json.loads(args.pond.read_text())))
     except (OSError, ValueError, KeyError, IndexError, TypeError) as exc:
         print(f"fake boat: cannot work a pond from {args.pond}: {exc}", file=sys.stderr)
         return 2
 
     os.environ[config.API_URL_ENV] = args.api_url
     confine_uploads(args.api_url)
-    server = serve_autopilot(Autopilot(path))
+    server = serve_autopilot(Autopilot(walk))
     os.environ[entry.MAVLINK2REST_URL_ENV] = f"http://127.0.0.1:{server.server_port}"
     pico = Pico(cadence_s=args.cadence)
     threading.Thread(target=pico.run_forever, daemon=True, name="pico").start()
@@ -486,8 +540,9 @@ def main(argv: "list[str] | None" = None) -> int:
     # carry the Pico's VID.
     reader.find_pico_port = lambda: pico.port
     clock.clock_is_trustworthy = bench_host.trust_this_bench_clock
-    print(f"fake boat: {len(path)} waypoints across {args.pond.name}, a reading every "
-          f"{args.cadence:g} s, uploading to {args.api_url} only", file=sys.stderr)
+    print(f"fake boat: {walk.first_pass} waypoints a pass across {args.pond.name}, "
+          f"a reading every {args.cadence:g} s, uploading to {args.api_url} only",
+          file=sys.stderr)
     return entry.main([])
 
 
