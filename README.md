@@ -480,3 +480,31 @@ that reboots it into BOOTSEL: the board stops being a serial device, comes back
 as mass storage, and logging stops with nothing written to say why. The current
 firmware disables it, but this stays pinned regardless, since the reset is
 triggered by the host's choice rather than the firmware's.
+
+### With no Pico or autopilot either
+
+`tools/fake_boat.py` runs this process, unchanged, against a fake Pico on a
+pseudo-terminal and a fake MAVLink2Rest whose position works lanes across a
+pond. Everything from the serial line to the batch upload is the real code, so a
+caddis-api sees what a boat working that pond would send. Give it the pond's
+outline from the pond page's **Download GeoJSON**, and run it in this image with
+`tools/` mounted, since the image ships without it:
+
+```bash
+docker run --rm -it -v "$PWD/tools:/app/tools:ro" \
+    -v "$PWD/pond.geojson:/pond.geojson:ro" -e CADDIS_API_TOKEN \
+    --entrypoint python3 <manta-link image> tools/fake_boat.py /pond.geojson \
+    --api-url https://squadron-staging-928515830511.us-central1.run.app
+```
+
+`-e CADDIS_API_TOKEN` passes the device token through from your shell, so it is
+never typed into the command; a `.env` in a mounted `/app/data` works as on a
+boat. For a caddis-api on the same machine, add `--network container:<its
+container>` and use `--api-url http://127.0.0.1:8000`: plain http is accepted
+only on loopback.
+
+It refuses production. Its readings would be filed against a real pond as if a
+drone had measured them, so it will not start against a `caddistech.com` host or
+production's Cloud Run address, and it confines uploads to the one API it was
+given: the production fallback this process uses for an unset or refused URL is
+replaced with one that cannot resolve.
