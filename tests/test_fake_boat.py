@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -325,27 +326,51 @@ def test_a_cadence_that_would_flood_the_api_is_refused(confined, tmp_path, caden
 # --- against the real reader ---------------------------------------------------
 
 
+@contextmanager
+def _reading(pico, monkeypatch, *, answering):
+    """MANTA Link's SerialReader serving `pico`'s port, on a thread that ends
+    with the test. Its one-port _serve rather than run_forever, which never
+    returns and would go on reopening ports for the rest of the session: the
+    pseudo-terminal closing under _serve is what ends it."""
+    monkeypatch.setattr(clock, "clock_is_trustworthy", lambda: answering)
+    records: deque = deque()
+    port_owner = SerialReader(records=records)
+
+    def serve():
+        try:
+            port_owner._serve(pico.port)
+        except Exception:
+            pass
+
+    owner = threading.Thread(target=serve, daemon=True)
+    talking = threading.Thread(target=pico.run_forever, daemon=True)
+    owner.start()
+    talking.start()
+    try:
+        yield records
+    finally:
+        pico.stopped.set()
+        talking.join(timeout=5)
+        pico.close()
+        owner.join(timeout=5)
+        assert not owner.is_alive(), "the reader outlived its port"
+
+
+def _until(ready, seconds=10):
+    deadline = time.monotonic() + seconds
+    while not ready() and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+
 @pytest.mark.skipif(not hasattr(os, "openpty"), reason="pseudo-terminals are Unix only")
 def test_the_real_reader_answers_the_fake_pico_and_takes_its_readings(monkeypatch):
     """The fake end to end on MANTA Link's side of the port: the time asked for
     is answered, and what follows arrives as stamped records."""
     pico = fake_boat.Pico(cadence_s=0.05)
-    monkeypatch.setattr(reader, "find_pico_port", lambda: pico.port)
-    monkeypatch.setattr(clock, "clock_is_trustworthy", lambda: True)
-    records: deque = deque()
-    port_owner = SerialReader(records=records)
-    threading.Thread(target=port_owner.run_forever, daemon=True).start()
-    talking = threading.Thread(target=pico.run_forever, daemon=True)
-    talking.start()
 
-    deadline = time.monotonic() + 10
-    while len(records) < 2 and time.monotonic() < deadline:
-        time.sleep(0.05)
-    pico.stopped.set()
-    talking.join(timeout=5)
-    pico.close()
+    with _reading(pico, monkeypatch, answering=True) as records:
+        _until(lambda: pico.answered.is_set() and len(records) >= 3)
 
     assert pico.answered.is_set()
-    assert len(records) >= 2
     stamped = json.loads(records[-1][0])
     assert abs(stamped["epoch_ms"] - time.time() * 1000) < 60_000
