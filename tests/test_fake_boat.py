@@ -24,7 +24,7 @@ from manta_link import clock, config, framing, gps, mavlink2rest, reader, record
 from manta_link.reader import SerialReader  # noqa: E402
 from tools import fake_boat  # noqa: E402
 
-from .golden import READING  # noqa: E402
+from .golden import READING, mavlink  # noqa: E402
 
 STAGING = "https://squadron-staging-928515830511.us-central1.run.app"
 
@@ -221,6 +221,30 @@ def test_the_autopilot_keeps_talking_and_the_boat_keeps_moving(autopilot):
     assert gps.read_coordinates(dict(after.fields)) != gps.read_coordinates(
         dict(before.fields)
     )
+
+
+def _shape(value):
+    """Keys, nesting and value types, which the captures pin and values do not."""
+    if isinstance(value, dict):
+        return {key: _shape(inner) for key, inner in value.items()}
+    if isinstance(value, list):
+        return [_shape(inner) for inner in value]
+    return type(value).__name__
+
+
+@pytest.mark.parametrize("name, capture", [
+    ("GLOBAL_POSITION_INT", "global_position_int"),
+    ("GPS_RAW_INT", "gps_raw_int_3d"),
+    ("HEARTBEAT", "heartbeat"),
+    ("VFR_HUD", "vfr_hud"),
+])
+def test_each_message_has_the_shape_captured_off_the_bench_rig(name, capture):
+    """The fake's fields are copied from tests/data by hand. When a capture is
+    refreshed for a mavlink2rest or ArduRover change, this is what says the
+    fake still serves what the poller will meet on a boat."""
+    served = fake_boat.Autopilot(fake_boat.Walk(POND)).message(name)
+
+    assert _shape(served) == _shape(json.loads(mavlink(capture)))
 
 
 def test_a_message_the_autopilot_does_not_send_is_absent(autopilot):
