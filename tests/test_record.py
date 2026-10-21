@@ -1204,6 +1204,25 @@ class TestBootRecords:
         """The reading line's tripwire, for the other kind of record."""
         assert record.unknown_keys(json.loads(BOOT_LINE)) == []
 
+    def test_every_bring_up_field_the_firmware_sends_is_known(self):
+        """The bring-up fields BOOT_LINE predates, with the values the
+        firmware's own flashing-and-preflight.md shows. This pins the names the
+        mapping must keep knowing; a name the firmware adds later is caught at
+        runtime by the unknown-key report instead."""
+        parsed = json.loads(BOOT_LINE)
+        parsed.update({
+            "ph_calibration": "?Cal,2",
+            "ph_slope": "?Slope,99.7,100.3,-0.9",
+            "ph_scale": "?pHext,1",
+            "ph_device_info": "?i,pH,2.15",
+            "cond_probe_k": "?K,1.0",
+            "cond_tds_factor": "?TDS,0.54",
+            "cond_outputs": "?O,EC,TDS,S",
+            "ph_auto_poll_s": 0,
+            "cond_auto_poll_s": None,
+        })
+        assert record.unknown_keys(parsed) == []
+
     def test_a_new_boot_field_is_still_named(self):
         parsed = json.loads(BOOT_LINE)
         parsed["uv_pad_mv"] = 12

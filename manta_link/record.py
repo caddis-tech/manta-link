@@ -169,6 +169,11 @@ BOOT_KEYS = frozenset({
     "cond_probe_k",
     "cond_tds_factor",
     "cond_outputs",
+    # Each circuit's answer to `C,?`: 0 when it speaks only when asked, n when it
+    # still streams a reading every n seconds on its own, and null when it gave
+    # no answer (AquadronePicoFirmware#144).
+    "ph_auto_poll_s",
+    "cond_auto_poll_s",
     "truncated",
 })
 
