@@ -14,7 +14,7 @@ is handed a `Binding` and never a token, and there is no spelling of
 
 A missing token is a normal state, not an error. Nothing POSTs, nothing spins,
 capture and spool and archive carry on, and the reader keeps answering `TIME?`.
-Dropping a token in starts uploads within one heartbeat with no restart, and a
+Dropping a token in starts uploads within a minute with no restart, and a
 401 self-heals the same way, because a container restart is the one event that
 can lose an in-flight `TIME?`.
 """
@@ -88,8 +88,18 @@ class Config:
         return fingerprint_of(self.token)
 
     @property
+    def devices_url(self) -> str:
+        """The prefix both endpoints below are built on, so tools/fake_boat.py
+        can confine every request this process makes to caddis-api in one place."""
+        return f"{self.api_url.rstrip('/')}/api/v1/devices/"
+
+    @property
     def batch_endpoint(self) -> str:
-        return f"{self.api_url.rstrip('/')}/api/v1/devices/telemetry/batch/"
+        return f"{self.devices_url}telemetry/batch/"
+
+    @property
+    def heartbeat_endpoint(self) -> str:
+        return f"{self.devices_url}heartbeat/"
 
 
 @dataclass(frozen=True)
@@ -153,12 +163,12 @@ class TokenSession:
 
 
 class ConfigWatcher:
-    """Re-reads the environment file on the heartbeat, and says what changed.
+    """Re-reads the environment file once a minute, and says what changed.
 
     Never on the reader thread once the port is open. The one exception is the
     synchronous read `main` does before the reader starts, which is on the main
     thread by definition: without it a boat provisioned through Kraken's Env
-    would wait a full heartbeat for its first upload.
+    would wait a full minute for its first upload.
     """
 
     def __init__(self, data_dir: Path, tokens: TokenSession) -> None:
@@ -324,7 +334,7 @@ class ConfigWatcher:
 
         if not stat.S_ISREG(info.st_mode):
             # A FIFO reports st_size 0, so the size gate below does not catch
-            # one, and opening it blocks the heartbeat for as long as nothing
+            # one, and opening it blocks health's tick for as long as nothing
             # writes to it.
             return self._refuse_file("is not a regular file")
         if info.st_size > MAX_ENV_BYTES:

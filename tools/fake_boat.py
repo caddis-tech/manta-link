@@ -3,9 +3,9 @@
 against a caddis-api with nothing plugged in.
 
 Everything from the serial line on is MANTA Link's own: framing, the TIME?
-answer, record mapping, GPS enrichment, the spool, client_ref, and the batch
-upload with its retries. Only its two inputs are made up. The Pico is a
-pseudo-terminal speaking the firmware's line format, and MAVLink2Rest is a local
+answer, record mapping, GPS enrichment, the spool, client_ref, the batch upload
+with its retries, and the heartbeat. Only its two inputs are made up. The Pico is
+a pseudo-terminal speaking the firmware's line format, and MAVLink2Rest is a local
 HTTP server answering in the shapes captured off the bench rig, with a position
 that works lanes across a pond's traced boundary. So what reaches the API is
 what a boat working that pond would send, as of whichever MANTA Link runs it.
@@ -63,7 +63,8 @@ PRODUCTION_DOMAIN = "caddistech.com"
 PRODUCTION_PROJECT_NUMBER = "172019847409"
 PRODUCTION_SERVICE = "django-backend"
 
-# Where an upload goes when its URL is not the one named on the command line.
+# Where an upload or a heartbeat goes when its URL is not the one named on the
+# command line.
 # .invalid is reserved never to resolve (RFC 2606), so it fails before a byte
 # leaves the machine, and the uploader's own retry and logging take it from there.
 REFUSED_API_URL = "https://refused-by-fake-boat.invalid"
@@ -120,22 +121,24 @@ def confine_uploads(api_url: str) -> None:
     Rebound on the module and the class rather than passed in, as bench_host
     rebinds the clock: config.py is the one place an upload's address is
     decided, and the package should not grow a seam that exists only for this.
-    The fallback rebinding stops being needed for refused URLs once the
-    package stops failing open (caddis-tech/manta-link#31).
+    `devices_url` rather than each endpoint, so the heartbeat is confined with
+    the upload and an endpoint added later is too. The fallback rebinding stops
+    being needed for refused URLs once the package stops failing open
+    (caddis-tech/manta-link#31).
     """
     allowed = _origin(api_url)
-    shipped = config.Config.batch_endpoint.fget
+    shipped = config.Config.devices_url.fget
     refusals = Throttle(REFUSAL_LOG_INTERVAL_S)
 
-    def batch_endpoint(self: config.Config) -> str:
+    def devices_url(self: config.Config) -> str:
         if _origin(self.api_url) == allowed:
             return shipped(self)
         if refusals.should_emit():
-            log.error("fake boat: refusing to upload anywhere but %s", api_url)
+            log.error("fake boat: refusing to post anywhere but %s", api_url)
         return shipped(config.Config(api_url=REFUSED_API_URL))
 
     config.DEFAULT_API_URL = REFUSED_API_URL
-    config.Config.batch_endpoint = property(batch_endpoint)  # type: ignore[assignment]
+    config.Config.devices_url = property(devices_url)  # type: ignore[assignment]
 
 
 # --- the pond ------------------------------------------------------------------
@@ -576,7 +579,7 @@ def main(argv: "list[str] | None" = None) -> int:
     reader.find_pico_port = lambda: pico.port
     clock.clock_is_trustworthy = bench_host.trust_this_bench_clock
     print(f"fake boat: {walk.first_pass} waypoints a pass across {args.pond.name}, "
-          f"a reading every {args.cadence:g} s, uploading to {args.api_url} only",
+          f"a reading every {args.cadence:g} s, posting to {args.api_url} only",
           file=sys.stderr)
     return entry.main([])
 

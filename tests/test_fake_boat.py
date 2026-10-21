@@ -55,7 +55,7 @@ class Clock:
 def confined(monkeypatch):
     """confine_uploads rebinds module state; put it back after each test."""
     monkeypatch.setattr(config, "DEFAULT_API_URL", config.DEFAULT_API_URL)
-    monkeypatch.setattr(config.Config, "batch_endpoint", config.Config.batch_endpoint)
+    monkeypatch.setattr(config.Config, "devices_url", config.Config.devices_url)
     monkeypatch.delenv(config.API_URL_ENV, raising=False)
 
 
@@ -303,9 +303,34 @@ def test_uploads_go_to_the_named_api_and_nowhere_else(confined):
     assert all(url.startswith(fake_boat.REFUSED_API_URL) for url in elsewhere)
 
 
+def test_heartbeats_are_confined_with_the_uploads(confined):
+    fake_boat.confine_uploads(STAGING)
+
+    named = config.Config(api_url=STAGING).heartbeat_endpoint
+    elsewhere = [
+        config.Config(api_url="https://api.caddistech.com").heartbeat_endpoint,
+        config.Config().heartbeat_endpoint,
+    ]
+
+    assert named == f"{STAGING}/api/v1/devices/heartbeat/"
+    assert all(url.startswith(fake_boat.REFUSED_API_URL) for url in elsewhere)
+
+
+def test_every_endpoint_config_builds_is_confined(confined):
+    """So an endpoint added to Config later cannot skip confine_uploads."""
+    fake_boat.confine_uploads(STAGING)
+    endpoints = [name for name in dir(config.Config) if name.endswith("_endpoint")]
+
+    built = [getattr(config.Config(), name) for name in endpoints]
+
+    assert endpoints
+    assert all(url.startswith(fake_boat.REFUSED_API_URL) for url in built)
+
+
+@pytest.mark.parametrize("endpoint", ["batch_endpoint", "heartbeat_endpoint"])
 @pytest.mark.parametrize("written", [None, "http://10.0.0.5:8000", "https://user:pw@x.org"])
 def test_a_missing_or_refused_url_resolves_to_nowhere_not_production(
-    confined, tmp_path, written
+    confined, tmp_path, written, endpoint
 ):
     """MANTA Link's own answer to both is production, which is right for a boat
     and the one place a fake one must never post."""
@@ -316,7 +341,7 @@ def test_a_missing_or_refused_url_resolves_to_nowhere_not_production(
 
     watcher.reload()
 
-    assert watcher.config.batch_endpoint.startswith(fake_boat.REFUSED_API_URL)
+    assert getattr(watcher.config, endpoint).startswith(fake_boat.REFUSED_API_URL)
 
 
 @pytest.mark.parametrize("argv", [

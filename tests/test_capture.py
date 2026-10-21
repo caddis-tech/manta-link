@@ -156,7 +156,7 @@ class TestDroppedRecords:
         assert captured + counters.get("records_dropped") == fed
 
     def test_the_loss_reaches_the_heartbeat(self, counters, caplog):
-        """The heartbeat is the only outbound signal a Release boat has."""
+        """The counter line is where a boat's own log shows what it lost."""
         records = new_record_buffer()
         CaptureWorker(records, new_log_buffer(), counters)
         for _ in range(RECORD_BUFFER_MAX + 3):

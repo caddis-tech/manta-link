@@ -68,7 +68,8 @@ firmware rejects both and only says so on one side.
 | `record.py` | The envelope, the timestamp policy, and the field mapping |
 | `spool.py` | The durable queue the upload drains, and where it lives |
 | `archive.py` | The rotating NDJSON copy that stays on the boat |
-| `health.py` | Counters, the heartbeat, and restarting a worker that died |
+| `health.py` | Counters, the counter log line, and restarting a worker that died |
+| `heartbeat.py` | The bare beat POSTed to caddis-api every minute |
 | `logging_setup.py` | The log queue, and the one thread that writes to stdout |
 | `supervisor.py` | Keeping a loop alive through anything that is not a shutdown |
 | `__main__.py` | Signal handling, and running the reader on the main thread |
@@ -272,9 +273,8 @@ ssh <boat> 'printf "CADDIS_API_TOKEN=%s\n" "<token>" > /app/data/.env'
 ```
 
 `/app/data` is the default; `AQUADRONE_DATA_DIR` overrides it. The difference
-that matters is restart, not precedence: the file is re-read on every
-heartbeat, so a token dropped in starts uploads **within a minute with no
-restart**, while editing Kraken's `Env` recreates the container -- the one
+that matters is restart, not precedence: the file is re-read once a minute,
+so a token dropped in starts uploads **within a minute with no restart**, while editing Kraken's `Env` recreates the container -- the one
 event that can lose an in-flight `TIME?`. Use the file to rotate a token on a
 boat that is up; use `Env` to provision one, which is the only path that does
 not need SSH.
@@ -293,7 +293,7 @@ One other knob, optional: `CADDIS_BATCH_MAX` (default 50).
 
 #### Rotation
 
-Overwrite the `.env` line. The next heartbeat rebinds with no restart, and
+Overwrite the `.env` line. Within a minute it rebinds with no restart, and
 the log says so:
 
 ```
@@ -305,7 +305,7 @@ never logged**, and neither is any transport error message, because a `requests`
 exception can carry the header it failed on.
 
 Rotating through Kraken's `Env` instead recreates the container, so the new
-token is live at the next start rather than the next heartbeat.
+token is live at the next start rather than within a minute.
 
 Rotation replaces the whole session rather than re-heading a live one, so an
 in-flight POST finishes on the credential it started with. There is no window
@@ -351,7 +351,8 @@ real names.
 The response is not plain text. It is a stream of JSON fragments whose `data`
 field is base64, interleaved with Kraken keepalives that decode to the bare
 string `heartbeat` -- discard those. MANTA Link's own counter line is
-`heartbeat:` with a colon.
+`heartbeat:` with a colon, and `heartbeat POST failed` is the beat it sends to
+caddis-api.
 
 With SSH to the host rather than the BlueOS terminal, `docker logs` works as
 normal.
@@ -408,6 +409,13 @@ file)` and the spool starts draining. Two counters on the heartbeat are the ones
 to read: `spool_write_failures` above zero means a read-only bind and the boat is
 storing nothing, and `readings_quarantined` above zero means a batch the API kept
 refusing has been set aside so the rest of the queue can move.
+
+With a token, MANTA Link also POSTs a bare beat to caddis-api's `heartbeat/` at
+start, or within two minutes of a token arriving, and every minute after, so Squadron can tell MANTA Link running from a
+boat that is off. `heartbeats_posted` climbing on the `heartbeat:` line means it
+is getting through. `heartbeat_post_failures` climbing, with `heartbeat POST
+failed (HTTP 400)`, means a caddis-api from before caddis-tech/caddis-api#453,
+which still records the beat as contact but answers it with a 400.
 
 On the Pico's serial stream:
 

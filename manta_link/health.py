@@ -1,11 +1,11 @@
-"""Counters, the heartbeat, and the watchdog that restarts a dead worker.
+"""Counters, the counter line, and the watchdog that restarts a dead worker.
 
 Health is itself a worker, so something outside it has to notice when it dies.
 That is the main thread: it sits inside the reader loop, which wakes every 0.2s
 for the read timeout and is the only context guaranteed to still be running.
 Without that check, health's death silently removes the watchdog from every
-other worker and stops the heartbeat, which on a Release boat is the only
-outbound signal there is.
+other worker, the heartbeat POST's among them, which on a Release boat is the
+only outbound signal there is.
 """
 
 import logging
@@ -18,6 +18,8 @@ from . import supervisor
 
 log = logging.getLogger(__name__)
 
+# The counter line's cadence, and the config reload's. The POST to caddis-api
+# keeps its own, heartbeat.BEAT_INTERVAL_S.
 HEARTBEAT_INTERVAL_S = 60.0
 
 WATCHDOG_POLL_S = 1.0
@@ -37,7 +39,7 @@ class Worker:
 
 
 class Counters:
-    """Integer tallies for the heartbeat, safe to bump from any thread.
+    """Integer tallies for the counter line, safe to bump from any thread.
 
     The lock is held for an integer add and nothing else. It is never taken
     across I/O, which is the property that makes it safe to leave on a path the
@@ -63,7 +65,8 @@ class Counters:
 
 
 class Health:
-    """Runs the workers, restarts the dead ones, and beats every minute."""
+    """Runs the workers, restarts the dead ones, and logs the counters every
+    minute."""
 
     def __init__(
         self,
@@ -99,7 +102,7 @@ class Health:
         self._start_self()
 
     def tick(self) -> None:
-        """One watchdog pass, and a heartbeat if one is due."""
+        """One watchdog pass, and the counter line if one is due."""
         now = time.monotonic()
         self._last_tick = now
         self._restart_dead_workers()
@@ -175,7 +178,8 @@ class Health:
             self._start_worker(worker)
 
     def _beat(self, now: float) -> None:
-        """The only periodic proof of life. A POST replaces this in step 6."""
+        """The counters, as a log line. The beat caddis-api hears is the
+        heartbeat worker's POST, which carries none of them (manta-link#7)."""
         self._last_beat = now
         self._run_on_beat()
         self._counters.bump("heartbeats")
@@ -184,12 +188,12 @@ class Health:
                  ", ".join(f"{k}={v}" for k, v in sorted(tallies.items())))
 
     def _run_on_beat(self) -> None:
-        """Run the periodic hook, without letting it cost us the heartbeat.
+        """Run the periodic hook, without letting it cost us the counter line.
 
         Wrapped the same way SerialReader._notify is, and for the same reason: a
-        hook that raises must not take out the only outbound signal a Release
-        boat has. Called before the tallies are read, so anything it counts
-        lands in the beat that reports it.
+        hook that raises must not take the counter line with it. Called before
+        the tallies are read, so anything it counts lands in the line that
+        reports it.
         """
         if self._on_beat is None:
             return
