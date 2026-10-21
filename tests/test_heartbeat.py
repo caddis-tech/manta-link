@@ -245,10 +245,10 @@ class TestTheLoop:
 
 class TestTheWiring:
     def test_main_runs_it_as_a_supervised_worker(self, monkeypatch, tmp_path):
-        registered: list[str] = []
+        registered: dict = {}
         stub_out_the_hardware(monkeypatch, lambda *_, **__: None)
         monkeypatch.setattr(__main__, "Health", lambda *_, **__: SimpleNamespace(
-            register=lambda name, _run: registered.append(name),
+            register=lambda name, run: registered.update({name: run}),
             start=lambda: None,
             check_from_main_thread=lambda: None,
             note_restart=lambda *_, **__: None,
@@ -258,4 +258,4 @@ class TestTheWiring:
         monkeypatch.setenv(__main__.VOLUME_ENV, str(tmp_path))
 
         assert __main__.main([]) == 0
-        assert "heartbeat" in registered
+        assert isinstance(registered["heartbeat"].__self__, Heartbeat)

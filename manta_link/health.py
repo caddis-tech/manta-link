@@ -18,6 +18,8 @@ from . import supervisor
 
 log = logging.getLogger(__name__)
 
+# The counter line's cadence, and the config reload's. The POST to caddis-api
+# keeps its own, heartbeat.BEAT_INTERVAL_S.
 HEARTBEAT_INTERVAL_S = 60.0
 
 WATCHDOG_POLL_S = 1.0

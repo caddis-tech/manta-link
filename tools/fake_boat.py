@@ -63,7 +63,8 @@ PRODUCTION_DOMAIN = "caddistech.com"
 PRODUCTION_PROJECT_NUMBER = "172019847409"
 PRODUCTION_SERVICE = "django-backend"
 
-# Where an upload goes when its URL is not the one named on the command line.
+# Where an upload or a heartbeat goes when its URL is not the one named on the
+# command line.
 # .invalid is reserved never to resolve (RFC 2606), so it fails before a byte
 # leaves the machine, and the uploader's own retry and logging take it from there.
 REFUSED_API_URL = "https://refused-by-fake-boat.invalid"

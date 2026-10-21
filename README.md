@@ -273,9 +273,8 @@ ssh <boat> 'printf "CADDIS_API_TOKEN=%s\n" "<token>" > /app/data/.env'
 ```
 
 `/app/data` is the default; `AQUADRONE_DATA_DIR` overrides it. The difference
-that matters is restart, not precedence: the file is re-read on every
-heartbeat, so a token dropped in starts uploads **within a minute with no
-restart**, while editing Kraken's `Env` recreates the container -- the one
+that matters is restart, not precedence: the file is re-read once a minute,
+so a token dropped in starts uploads **within a minute with no restart**, while editing Kraken's `Env` recreates the container -- the one
 event that can lose an in-flight `TIME?`. Use the file to rotate a token on a
 boat that is up; use `Env` to provision one, which is the only path that does
 not need SSH.
@@ -294,7 +293,7 @@ One other knob, optional: `CADDIS_BATCH_MAX` (default 50).
 
 #### Rotation
 
-Overwrite the `.env` line. The next heartbeat rebinds with no restart, and
+Overwrite the `.env` line. Within a minute it rebinds with no restart, and
 the log says so:
 
 ```
@@ -306,7 +305,7 @@ never logged**, and neither is any transport error message, because a `requests`
 exception can carry the header it failed on.
 
 Rotating through Kraken's `Env` instead recreates the container, so the new
-token is live at the next start rather than the next heartbeat.
+token is live at the next start rather than within a minute.
 
 Rotation replaces the whole session rather than re-heading a live one, so an
 in-flight POST finishes on the credential it started with. There is no window
@@ -411,8 +410,8 @@ to read: `spool_write_failures` above zero means a read-only bind and the boat i
 storing nothing, and `readings_quarantined` above zero means a batch the API kept
 refusing has been set aside so the rest of the queue can move.
 
-With a token, MANTA Link also POSTs a bare beat to caddis-api's `heartbeat/` once
-at start and then every minute, so Squadron can tell MANTA Link running from a
+With a token, MANTA Link also POSTs a bare beat to caddis-api's `heartbeat/` at
+start, or within two minutes of a token arriving, and every minute after, so Squadron can tell MANTA Link running from a
 boat that is off. `heartbeats_posted` climbing on the `heartbeat:` line means it
 is getting through. `heartbeat_post_failures` climbing, with `heartbeat POST
 failed (HTTP 400)`, means a caddis-api from before caddis-tech/caddis-api#453,
