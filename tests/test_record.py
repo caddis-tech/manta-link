@@ -63,6 +63,16 @@ BOOT_LINE = (
     b'"temp_probes":1,"uv_probe":"present","boot_epoch_ms":1754400000000}'
 )
 
+# What firmware 2.1.3 adds to every reading (AquadronePicoFirmware@9a6a668):
+# each circuit's parsed ?STATUS, under the boot line's names and with its
+# values. The golden line was rendered at 2.1.2, one commit before.
+ATLAS_STATUS = {
+    "cond_restart": "B",
+    "cond_supply_mv": 4992,
+    "ph_restart": "P",
+    "ph_supply_mv": 5038,
+}
+
 
 @pytest.fixture
 def counters():
@@ -370,6 +380,20 @@ class TestMappingRot:
         recorder.capture(READING, reading(), time.monotonic())
 
         assert counters.get("payload_keys_unknown") == 0
+
+    def test_a_2_1_3_reading_with_atlas_status_bumps_nothing(self, counters, caplog):
+        """0.9.2 named these four for the boot record only, so every 2.1.3
+        reading counted four unknown keys: 1420 over a 355-reading bench run
+        (#25), with the warning firing every minute."""
+        calls: list[str] = []
+        recorder = Recorder(RecordingSpool(calls), RecordingArchive(calls), counters)
+        parsed = reading(**ATLAS_STATUS)
+
+        with caplog.at_level("WARNING"):
+            recorder.capture(json.dumps(parsed).encode(), parsed, time.monotonic())
+
+        assert counters.get("payload_keys_unknown") == 0
+        assert "does not know about" not in caplog.text
 
     def test_a_new_key_is_named_rather_than_passed_through_quietly(self):
         # Deliberately a field no filed firmware issue proposes. ms_since_boot
