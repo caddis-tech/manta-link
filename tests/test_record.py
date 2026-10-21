@@ -1205,15 +1205,16 @@ class TestBootRecords:
         assert record.unknown_keys(json.loads(BOOT_LINE)) == []
 
     def test_every_bring_up_field_the_firmware_sends_is_known(self):
-        """The whole startup line as current firmware writes it, bring-up
-        queries included. BOOT_LINE predates those, so without this nothing
-        notices when a name here falls behind the firmware's."""
+        """The bring-up fields BOOT_LINE predates, with the values the
+        firmware's own flashing-and-preflight.md shows. This pins the names the
+        mapping must keep knowing; a name the firmware adds later is caught at
+        runtime by the unknown-key report instead."""
         parsed = json.loads(BOOT_LINE)
         parsed.update({
-            "ph_calibration": "?CAL,3",
-            "ph_slope": "?SLOPE,99.7,100.3,-0.89",
-            "ph_scale": "?PHEXT,1",
-            "ph_device_info": "?I,pH,2.16",
+            "ph_calibration": "?Cal,2",
+            "ph_slope": "?Slope,99.7,100.3,-0.9",
+            "ph_scale": "?pHext,1",
+            "ph_device_info": "?i,pH,2.15",
             "cond_probe_k": "?K,1.0",
             "cond_tds_factor": "?TDS,0.54",
             "cond_outputs": "?O,EC,TDS,S",
