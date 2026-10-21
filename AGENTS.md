@@ -47,7 +47,8 @@ BOOTSEL, and logging stops with nothing written to say why.
 
 A `v*` tag runs `publish.yml`, which builds both architectures and pushes the image to
 `ghcr.io/caddis-tech/manta-link`. Boats install it through BlueOS's extension manager. A tag
-is a release to boats, so an assistant never pushes one.
+is a release to boats, so an assistant pushes one only when the person explicitly asks, and says
+first that it reaches boats.
 
 `aquadrone-setup` keeps a byte-identical copy of this repo's `Dockerfile` and reads its
 `permissions` and `version` labels. Change either and that copy needs the same change; nothing
