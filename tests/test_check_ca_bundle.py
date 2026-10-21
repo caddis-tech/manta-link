@@ -5,6 +5,7 @@ A test suite never reaches a real service, and the live check is the
 workflow's job, not the suite's.
 """
 
+import re
 import ssl
 import sys
 from pathlib import Path
@@ -91,6 +92,50 @@ class TestThePin:
         self, installed, pinned, same
     ):
         assert check_ca_bundle.same_version(installed, pinned) is same
+
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+class TestWhatItTrusts:
+    """What makes a pass mean anything: the check trusts what boats trust."""
+
+    def context_used(self) -> ssl.SSLContext:
+        used = []
+
+        def handshake(_host, context):
+            used.append(context)
+            return LEAF
+
+        check_host("api.test", BUNDLE, handshake=handshake,
+                   read_chain=never_reads_a_chain)
+        return used[0]
+
+    def test_it_trusts_the_bundle_and_not_the_machines_own_store(self):
+        """A store with the runner's certificates added would pass chains a
+        boat rejects, and every other test here would still pass."""
+        in_bundle = Path(BUNDLE).read_text(encoding="utf-8").count(
+            "-----BEGIN CERTIFICATE-----"
+        )
+
+        assert self.context_used().cert_store_stats()["x509"] == in_bundle
+
+    def test_it_requires_a_valid_certificate_for_the_host_asked_for(self):
+        context = self.context_used()
+
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname
+
+    def test_the_workflow_runs_the_python_boats_run(self):
+        """3.13 verifies more strictly than 3.11, so a check on another version
+        could pass a chain boats reject, or the reverse."""
+        dockerfile = (REPO / "Dockerfile").read_text(encoding="utf-8")
+        workflow_file = REPO / ".github" / "workflows" / "ca-bundle.yml"
+        workflow = workflow_file.read_text(encoding="utf-8")
+        base = re.search(r"^FROM python:(\d+\.\d+)", dockerfile, re.MULTILINE)
+
+        assert base is not None
+        assert f'python-version: "{base.group(1)}"' in workflow
 
 
 class TestOneHost:
