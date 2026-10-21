@@ -1,0 +1,68 @@
+name: CA bundle
+
+# Boats trust exactly the certifi bundle frozen into their image, and the API's
+# Google-managed certificate can renew onto a chain that bundle does not know
+# (#29). tools/check_ca_bundle.py says why. This runs it daily and whenever the
+# pin could have moved, and keeps one open issue while it fails, so a bad
+# renewal is found within a day rather than from a boat's logs.
+#
+# The repo is public, so these runs cost no Actions minutes.
+
+on:
+  schedule:
+    # Daily, off the hour: scheduled runs on the hour queue behind everyone's.
+    - cron: "23 7 * * *"
+  push:
+    branches: [ main ]
+    paths:
+      - pyproject.toml
+      - Dockerfile
+      - tools/check_ca_bundle.py
+      - .github/workflows/ca-bundle.yml
+  pull_request:
+    paths:
+      - pyproject.toml
+      - Dockerfile
+      - tools/check_ca_bundle.py
+      - .github/workflows/ca-bundle.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Exactly the pin and nothing else. Only certifi decides what a boat
+      # trusts, and the script refuses to run against any other version.
+      - run: pip install "certifi==$(python tools/check_ca_bundle.py --pin)"
+
+      - id: check
+        run: python tools/check_ca_bundle.py --report "$RUNNER_TEMP/report.md"
+
+      # Not for a pull request: its failure belongs on the PR, and a fork's
+      # token cannot write issues anyway.
+      - if: failure() && steps.check.outcome == 'failure' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="The API's certificate does not verify against the CA bundle boats ship"
+          printf '\n[The failing run](%s)\n' "$RUN_URL" >> "$RUNNER_TEMP/report.md"
+          open=$(gh issue list --state open --search "in:title \"$title\"" \
+            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body-file "$RUNNER_TEMP/report.md"
+          else
+            gh issue create --title "$title" --label bug --body-file "$RUNNER_TEMP/report.md"
+          fi
