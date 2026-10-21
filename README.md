@@ -477,6 +477,22 @@ git push --tags
 GitHub Actions builds both architectures and pushes to
 `ghcr.io/caddis-tech/manta-link`.
 
+A boat trusts exactly the `certifi` pinned in `pyproject.toml` and the
+`Dockerfile`, frozen into its image, so the API's certificate has to keep
+verifying against that bundle through every renewal. The **CA bundle** workflow
+checks it daily, and on any change to the pin, with
+`tools/check_ca_bundle.py`. When it fails, it opens or updates one issue naming
+the host, the chain it was offered, and the pin it was checked against, and it
+closes that issue once it passes again. It checks the current pin only, so a
+pass says nothing about a boat still on an older image. GitHub turns a public
+repo's scheduled workflows off after 60 days without commits; if that happens,
+re-enable it from the Actions tab. Run it by hand the same way:
+
+```bash
+pip install "certifi==$(python tools/check_ca_bundle.py --pin)"
+python tools/check_ca_bundle.py
+```
+
 ## Testing without a boat
 
 Anything that can open the serial port can answer. To exercise the Pico half

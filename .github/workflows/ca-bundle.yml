@@ -1,0 +1,88 @@
+name: CA bundle
+
+# Boats trust exactly the certifi bundle frozen into their image, and the API's
+# Google-managed certificate can renew onto a chain that bundle does not know
+# (#29). tools/check_ca_bundle.py says why. This runs it daily and whenever the
+# pin could have moved, keeps one open issue while it fails, and closes that
+# issue once it passes again.
+#
+# The repo is public, so these runs cost no Actions minutes. GitHub disables a
+# public repo's scheduled workflows after 60 days with no commits; if the repo
+# goes that quiet, re-enable this one from the Actions tab.
+
+on:
+  schedule:
+    # Daily, off the hour: scheduled runs on the hour queue behind everyone's.
+    - cron: "23 7 * * *"
+  push:
+    branches: [ main ]
+    paths:
+      - pyproject.toml
+      - Dockerfile
+      - tools/check_ca_bundle.py
+      - .github/workflows/ca-bundle.yml
+  pull_request:
+    paths:
+      - pyproject.toml
+      - Dockerfile
+      - tools/check_ca_bundle.py
+      - .github/workflows/ca-bundle.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      # Neutral on purpose: a failure can be an untrusted chain, a hostname
+      # mismatch or an outage, and the report in the issue says which.
+      TITLE: "The daily check that boats trust the API's certificate is failing"
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Python boats run, from the Dockerfile's base image, because 3.13
+      # verifies more strictly than 3.11. tests/test_check_ca_bundle.py fails if
+      # the two drift apart.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Exactly the pin and nothing else. Only certifi decides what a boat
+      # trusts, and the script refuses to run against any other version.
+      - run: pip install "certifi==$(python tools/check_ca_bundle.py --pin)"
+
+      - id: check
+        run: python tools/check_ca_bundle.py --report "$RUNNER_TEMP/report.md"
+
+      # Neither issue step runs for a pull request: its result belongs on the
+      # PR, and a fork's token cannot write issues anyway.
+      - if: failure() && steps.check.outcome == 'failure' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          printf '\n[The failing run](%s)\n' "$RUN_URL" >> "$RUNNER_TEMP/report.md"
+          open=$(gh issue list --state open --search "in:title \"$TITLE\"" \
+            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body-file "$RUNNER_TEMP/report.md"
+          else
+            gh issue create --title "$TITLE" --label bug --body-file "$RUNNER_TEMP/report.md"
+          fi
+
+      - if: success() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          open=$(gh issue list --state open --search "in:title \"$TITLE\"" \
+            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          if [ -n "$open" ]; then
+            printf '\nPassing again: [the run](%s).\n' "$RUN_URL" >> "$RUNNER_TEMP/report.md"
+            gh issue close "$open" --comment "$(cat "$RUNNER_TEMP/report.md")"
+          fi
