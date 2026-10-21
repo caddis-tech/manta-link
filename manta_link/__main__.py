@@ -27,6 +27,7 @@ from . import (
     capture,
     config,
     gps,
+    heartbeat,
     logging_setup,
     mavlink2rest,
     record,
@@ -193,6 +194,9 @@ def main(argv: list[str] | None = None) -> int:
     register_gps(health, positions, counters)
     uploader = upload.Uploader(store, recorder.anchor, tokens, watcher, counters)
     health.register("uploader", uploader.run_forever)
+    health.register(
+        "heartbeat", heartbeat.Heartbeat(tokens, watcher, counters).run_forever
+    )
     health.start()
 
     reader = SerialReader(

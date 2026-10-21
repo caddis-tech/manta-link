@@ -88,8 +88,18 @@ class Config:
         return fingerprint_of(self.token)
 
     @property
+    def devices_url(self) -> str:
+        """The prefix both endpoints below are built on, so tools/fake_boat.py
+        can confine every request this process makes in one place."""
+        return f"{self.api_url.rstrip('/')}/api/v1/devices/"
+
+    @property
     def batch_endpoint(self) -> str:
-        return f"{self.api_url.rstrip('/')}/api/v1/devices/telemetry/batch/"
+        return f"{self.devices_url}telemetry/batch/"
+
+    @property
+    def heartbeat_endpoint(self) -> str:
+        return f"{self.devices_url}heartbeat/"
 
 
 @dataclass(frozen=True)

@@ -68,7 +68,8 @@ firmware rejects both and only says so on one side.
 | `record.py` | The envelope, the timestamp policy, and the field mapping |
 | `spool.py` | The durable queue the upload drains, and where it lives |
 | `archive.py` | The rotating NDJSON copy that stays on the boat |
-| `health.py` | Counters, the heartbeat, and restarting a worker that died |
+| `health.py` | Counters, the counter log line, and restarting a worker that died |
+| `heartbeat.py` | The bare beat POSTed to caddis-api every minute |
 | `logging_setup.py` | The log queue, and the one thread that writes to stdout |
 | `supervisor.py` | Keeping a loop alive through anything that is not a shutdown |
 | `__main__.py` | Signal handling, and running the reader on the main thread |
@@ -351,7 +352,8 @@ real names.
 The response is not plain text. It is a stream of JSON fragments whose `data`
 field is base64, interleaved with Kraken keepalives that decode to the bare
 string `heartbeat` -- discard those. MANTA Link's own counter line is
-`heartbeat:` with a colon.
+`heartbeat:` with a colon, and `heartbeat POST failed` is the beat it sends to
+caddis-api.
 
 With SSH to the host rather than the BlueOS terminal, `docker logs` works as
 normal.
@@ -408,6 +410,13 @@ file)` and the spool starts draining. Two counters on the heartbeat are the ones
 to read: `spool_write_failures` above zero means a read-only bind and the boat is
 storing nothing, and `readings_quarantined` above zero means a batch the API kept
 refusing has been set aside so the rest of the queue can move.
+
+With a token, MANTA Link also POSTs a bare beat to caddis-api's `heartbeat/` once
+at start and then every minute, so Squadron can tell MANTA Link running from a
+boat that is off. `heartbeats_posted` climbing on the `heartbeat:` line means it
+is getting through. `heartbeat_post_failures` climbing, with `heartbeat POST
+failed (HTTP 400)`, means a caddis-api from before caddis-tech/caddis-api#453,
+which still records the beat as contact but answers it with a 400.
 
 On the Pico's serial stream:
 

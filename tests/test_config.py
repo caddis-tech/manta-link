@@ -292,6 +292,10 @@ class TestTheApiUrl:
         built = Config(api_url="https://example.test/").batch_endpoint
         assert built == "https://example.test/api/v1/devices/telemetry/batch/"
 
+    def test_the_heartbeat_endpoint_is_built_from_it(self):
+        built = Config(api_url="https://example.test/").heartbeat_endpoint
+        assert built == "https://example.test/api/v1/devices/heartbeat/"
+
 
 class TestTheBatchSize:
     def test_a_sensible_value_is_taken(self, tmp_path, watcher):

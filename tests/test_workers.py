@@ -184,8 +184,8 @@ class TestReleaseBoat:
 
         A Release image writes records to the card and puts none on USB, so an
         idle capture path is the correct outcome rather than a suspicious one.
-        The heartbeat is what proves the process is alive, which is why it has
-        to keep firing when nothing else does.
+        The counter line is what proves the process is alive in its own log,
+        which is why it has to keep firing when nothing else does.
         """
         counters = Counters()
         records = new_record_buffer()
