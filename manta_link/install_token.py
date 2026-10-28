@@ -37,8 +37,8 @@ _CAN_FSYNC_DIRECTORY = hasattr(os, "O_DIRECTORY")
 def save_install_token(data_dir: Path) -> None:
     """Write the environment's token into the .env unless the file holds it.
 
-    The install settings are the newer, deliberate act, so their token replaces
-    a different one already in the file.
+    A token changes only through the installer, so a different one already in
+    the file is a hand edit, and the install settings' token replaces it.
     """
     token = os.environ.get(TOKEN_ENV, "").strip()
     if not token:
