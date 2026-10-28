@@ -28,6 +28,7 @@ from . import (
     config,
     gps,
     heartbeat,
+    install_token,
     logging_setup,
     mavlink2rest,
     record,
@@ -60,8 +61,8 @@ CONFIG_ENV_HELP: tuple[tuple[str, str], ...] = (
     (VOLUME_ENV, f"the persistent volume, default {DEFAULT_VOLUME}"),
     (DATA_DEVICE_ENV, "the removable device; unset leaves the archive off"),
     (MAVLINK2REST_URL_ENV, f"MAVLink2Rest, default {mavlink2rest.DEFAULT_URL}"),
-    (config.TOKEN_ENV, f"the API token; also read from ${VOLUME_ENV}/"
-                       f"{config.ENV_FILENAME}, which wins"),
+    (config.TOKEN_ENV, f"the API token; saved at start into ${VOLUME_ENV}/"
+                       f"{config.ENV_FILENAME}, which is read first"),
     (config.API_URL_ENV, f"the API, default {config.DEFAULT_API_URL}"),
 )
 
@@ -147,6 +148,31 @@ def open_or_carry_on(name: str, opener: Callable[[], None]) -> None:
                       "it is counted and lost until it can be", name)
 
 
+def load_config(tokens: config.TokenSession) -> config.ConfigWatcher:
+    """Save the install token into the .env, then read the config once.
+
+    In that order, so the first read already finds the token in the file.
+    """
+    volume = data_volume()
+    try:
+        install_token.save_install_token(volume)
+    except Exception as exc:
+        # Broad for open_or_carry_on's reason: every expected failure is already
+        # a warning in there, and nothing else may cost the port its owner. The
+        # type only, as upload.py logs it, since the token is in play here.
+        log.error("saving the API token into %s failed (%s); carrying on",
+                  volume, type(exc).__name__)
+
+    watcher = config.ConfigWatcher(volume, tokens)
+    # Read once here rather than waiting for the first beat. Health credits
+    # itself a full interval at start, so a boat provisioned through Kraken's
+    # Env would otherwise sit unconfigured for a minute after every install.
+    # main calls this on the main thread, which becomes the reader thread; no
+    # reload runs on it once the port is open.
+    watcher.reload()
+    return watcher
+
+
 def parse_args(argv: list[str] | None = None) -> None:
     """Refuse anything that is not a bare start, before the port is touched.
 
@@ -180,13 +206,7 @@ def main(argv: list[str] | None = None) -> int:
     recorder, store = build_durables(counters, positions)
 
     tokens = config.TokenSession()
-    watcher = config.ConfigWatcher(data_volume(), tokens)
-    # Read once here rather than waiting for the first beat. Health credits
-    # itself a full interval at start, so a boat provisioned through Kraken's
-    # Env would otherwise sit unconfigured for a minute after every install.
-    # This is the main thread, which becomes the reader thread below; no reload
-    # runs on it once the port is open.
-    watcher.reload()
+    watcher = load_config(tokens)
 
     worker = capture.CaptureWorker(records, logs, counters, sink=recorder.capture)
     health = Health(counters, on_beat=watcher.reload)

@@ -324,33 +324,49 @@ class ConfigWatcher:
         perfectly good one.
         """
         try:
-            info = self._path.stat()
-        except FileNotFoundError:
-            # The normal state on a boat with no token, and on every boat before
-            # provisioning. Not a refusal and not worth a line.
-            return None
-        except OSError as exc:
-            return self._refuse_file(f"could not be checked ({exc})")
-
-        if not stat.S_ISREG(info.st_mode):
-            # A FIFO reports st_size 0, so the size gate below does not catch
-            # one, and opening it blocks health's tick for as long as nothing
-            # writes to it.
-            return self._refuse_file("is not a regular file")
-        if info.st_size > MAX_ENV_BYTES:
-            return self._refuse_file(f"is larger than {MAX_ENV_BYTES} bytes")
-
-        try:
-            text = self._path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            return self._refuse_file(f"could not be read ({exc})")
-        return parse_env(text)
+            text = read_env_text(self._path)
+        except UnusableEnvFile as exc:
+            return self._refuse_file(str(exc))
+        return None if text is None else parse_env(text)
 
     def _refuse_file(self, why: str) -> "dict[str, str] | None":
         """Say so once, and answer None, which preserves the environment."""
         if self._refusal_log.should_emit():
             log.warning("%s %s; falling back to the environment", self._path, why)
         return None
+
+
+class UnusableEnvFile(Exception):
+    """A .env that is there but is not ours to read; the message says why."""
+
+
+def read_env_text(path: Path) -> str | None:
+    """The file's text exactly as stored, or None when there is no file.
+
+    Exactly as stored, line endings included, because install_token rewrites one
+    line of this text and has to put every other line back unchanged.
+    """
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        # The normal state on a boat with no token, and on every boat before
+        # provisioning. Not a refusal and not worth a line.
+        return None
+    except OSError as exc:
+        raise UnusableEnvFile(f"could not be checked ({exc})") from exc
+
+    if not stat.S_ISREG(info.st_mode):
+        # A FIFO reports st_size 0, so the size gate below does not catch
+        # one, and opening it blocks health's tick for as long as nothing
+        # writes to it.
+        raise UnusableEnvFile("is not a regular file")
+    if info.st_size > MAX_ENV_BYTES:
+        raise UnusableEnvFile(f"is larger than {MAX_ENV_BYTES} bytes")
+
+    try:
+        return path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise UnusableEnvFile(f"could not be read ({exc})") from exc
 
 
 def parse_env(text: str) -> dict[str, str]:
@@ -364,19 +380,27 @@ def parse_env(text: str) -> dict[str, str]:
     """
     values: dict[str, str] = {}
     for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("export "):
-            stripped = stripped[len("export "):].lstrip()
-        name, separator, value = stripped.partition("=")
-        if not separator:
-            continue
-        name = name.strip()
-        if not name:
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values[name] = value
+        assignment = parse_env_line(line)
+        if assignment is not None:
+            name, value = assignment
+            values[name] = value
     return values
+
+
+def parse_env_line(line: str) -> "tuple[str, str] | None":
+    """One line's name and value, or None for a line that assigns nothing."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[len("export "):].lstrip()
+    name, separator, value = stripped.partition("=")
+    if not separator:
+        return None
+    name = name.strip()
+    if not name:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return name, value
