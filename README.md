@@ -269,9 +269,22 @@ saved the API token from the environment into /app/data/.env, fingerprint 8b4d0e
 `replacing` appears only when the file held a different token, and that line is
 a warning. A token changes only through the installer, never by editing the
 file, so a different token in the file is a hand edit, and the install's token
-is saved over it. Only the token line changes; every other line of the file
-stays as it was. Nothing is saved when `Env` holds no token or the file already
-holds the same one, and in that second case the log says so:
+is saved over it.
+
+A token belongs to the API that issued it, so `Env`'s `CADDIS_API_URL` is saved
+with it, and the file's own is taken out when `Env` names none, so the default
+applies. A boat moved to another API that way says so in a warning naming both
+by scheme and host only:
+
+```
+moved this boat's uploads to the API at https://api.caddistech.com, from https://staging.example.test, as its install settings say
+```
+
+A bench boat is set up through DroneSetup with the bench's address, not by
+editing the file. Only the token and address lines change; every other line of
+the file stays as it was. Nothing is saved when `Env` holds no token or the file
+already holds the same token and address, and in that second case the log says
+so:
 
 ```
 /app/data/.env already holds the API token from the environment, fingerprint 8b4d0e77
@@ -291,12 +304,10 @@ reports its own token that way.
 
 If the save cannot happen, because the volume is read-only, the `.env` is a
 link or not a file MANTA Link will read, the token would take the file past
-64 KiB, or the file would send uploads to a different API from the install
-settings, it logs a warning naming the file and the reason, and carries on as
+64 KiB, or the token or address in `Env` would not read back from the file as
+it is, it logs a warning naming the file and the reason, and carries on as
 before: the file's token if it has one, `Env`'s if not. Leave the token in
-`Env` until that is fixed. A file that names no API sends to production, so a
-manual install naming another API keeps its token in `Env`; a bench boat's file
-pairs its own API with its own token.
+`Env` until that is fixed.
 
 **Kraken has no partial update.** The settings you send become the extension's
 entire configuration, so an `Env` entry left out of a reinstall is one the
