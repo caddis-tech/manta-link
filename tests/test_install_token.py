@@ -239,6 +239,106 @@ class TestAFileHoldingADifferentToken:
             f"# {config.TOKEN_ENV}={EARLIER}\n{config.TOKEN_ENV}={INSTALLED}\n")
 
 
+STAGING = "https://staging.example.test"
+
+
+@pytest.mark.usefixtures("installed_with_a_token")
+class TestTheAddressGoesWithTheToken:
+    """A token belongs to the API that issued it, so the install settings'
+    address is saved with it, and the settings win over the file for both."""
+
+    def test_an_install_naming_an_api_saves_it_with_the_token(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # Saved alone, a staging token would go to production once the
+        # installer took the settings back out.
+        monkeypatch.setenv(config.API_URL_ENV, STAGING)
+        write_env(tmp_path, f"{config.BATCH_MAX_ENV}=25\n")
+
+        with caplog.at_level("INFO"):
+            save_install_token(tmp_path)
+
+        assert read_env(tmp_path) == (
+            f"{config.BATCH_MAX_ENV}=25\n"
+            f"{config.TOKEN_ENV}={INSTALLED}\n"
+            f"{config.API_URL_ENV}={STAGING}\n")
+        assert "moved" not in caplog.text
+        monkeypatch.delenv(config.API_URL_ENV)
+        monkeypatch.delenv(config.TOKEN_ENV)
+        assert first_read(tmp_path).api_url == STAGING
+
+    def test_the_file_already_holding_the_token_gets_the_address_too(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv(config.API_URL_ENV, STAGING)
+        write_env(tmp_path, f"{config.TOKEN_ENV}={INSTALLED}\n")
+
+        save_install_token(tmp_path)
+
+        assert read_env(tmp_path) == (
+            f"{config.TOKEN_ENV}={INSTALLED}\n{config.API_URL_ENV}={STAGING}\n")
+
+    @pytest.mark.parametrize(
+        ("in_file", "shown"),
+        [(STAGING, STAGING),
+         ("https://ops:hunter2@staging.example.test/v1?key=k", STAGING),
+         ("https://[::1", "an address that does not parse")],
+        ids=["plain", "with a credential and a path", "that does not parse"],
+    )
+    def test_a_file_naming_another_api_is_moved_with_a_warning_naming_both(
+        self, tmp_path, caplog, in_file, shown
+    ):
+        # The settings name none, so the boat goes to production, the way the
+        # tools that set it up say it should.
+        write_env(tmp_path, f"{config.API_URL_ENV}={in_file}\n"
+                            f"{config.TOKEN_ENV}={EARLIER}\n")
+
+        with caplog.at_level("INFO"):
+            save_install_token(tmp_path)
+
+        assert read_env(tmp_path) == f"{config.TOKEN_ENV}={INSTALLED}\n"
+        moved = [r for r in caplog.records if "moved" in r.message]
+        assert [(r.levelname, r.message) for r in moved] == [(
+            "WARNING",
+            f"moved this boat's uploads to the API at {config.DEFAULT_API_URL}, "
+            f"from {shown}, as its install settings say")]
+        assert "hunter2" not in caplog.text and "key=k" not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("in_file", "installed"),
+        [("", STAGING), (f"{STAGING}/", STAGING), ("", None)],
+        ids=["no address in the file", "the same address with a slash",
+             "no address in either"],
+    )
+    def test_no_move_is_announced_when_the_boat_keeps_its_api(
+        self, tmp_path, monkeypatch, caplog, in_file, installed
+    ):
+        if installed is not None:
+            monkeypatch.setenv(config.API_URL_ENV, installed)
+        address = f"{config.API_URL_ENV}={in_file}\n" if in_file else ""
+        write_env(tmp_path, f"{address}{config.TOKEN_ENV}={EARLIER}\n")
+
+        with caplog.at_level("INFO"):
+            save_install_token(tmp_path)
+
+        assert "moved" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "url", [f"{STAGING}\n{config.TOKEN_ENV}={EARLIER}", f"'{STAGING}'"])
+    def test_an_address_that_would_not_read_back_keeps_the_token_out_too(
+        self, tmp_path, monkeypatch, caplog, url
+    ):
+        monkeypatch.setenv(config.API_URL_ENV, url)
+        write_env(tmp_path, f"{config.TOKEN_ENV}={EARLIER}\n")
+
+        with caplog.at_level("WARNING"):
+            save_install_token(tmp_path)
+
+        assert read_env(tmp_path) == f"{config.TOKEN_ENV}={EARLIER}\n"
+        assert (f"{config.API_URL_ENV} in the environment cannot be written as "
+                "one .env line") in caplog.text
+
+
 class TestNothingToSave:
     @pytest.mark.parametrize("value", [None, "", "   "])
     def test_no_token_in_the_environment_writes_no_file(
@@ -351,37 +451,6 @@ class TestAFileThatIsNotOursToRewrite:
 
         assert env_file(tmp_path).read_bytes() == original
         assert "could not be read" in caplog.text
-
-    def test_a_file_naming_another_api_keeps_its_own_token(self, tmp_path, caplog):
-        # A bench boat's file pairs its API with its token. The install token
-        # saved there would be sent to an API it was never issued for.
-        original = (f"{config.API_URL_ENV}=https://staging.example.test\n"
-                    f"{config.TOKEN_ENV}={EARLIER}\n")
-        write_env(tmp_path, original)
-
-        with caplog.at_level("WARNING"):
-            save_install_token(tmp_path)
-
-        assert read_env(tmp_path) == original
-        assert "does not send uploads to the API the install settings name" in (
-            caplog.text)
-
-    def test_an_install_naming_another_api_keeps_its_token_in_env(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        # A file naming no API sends to production. Saved there, a staging
-        # token would go to production once a reinstall changed Env's URL.
-        monkeypatch.setenv(config.API_URL_ENV, "https://staging.example.test")
-        original = f"{config.BATCH_MAX_ENV}=25\n"
-        write_env(tmp_path, original)
-
-        with caplog.at_level("WARNING"):
-            save_install_token(tmp_path)
-
-        assert read_env(tmp_path) == original
-        assert "does not send uploads to the API the install settings name" in (
-            caplog.text)
-        assert first_read(tmp_path).source == config.SOURCE_ENVIRONMENT
 
     def test_a_file_the_token_would_take_past_the_size_limit_is_left_alone(
         self, tmp_path, caplog
