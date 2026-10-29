@@ -121,9 +121,10 @@ class TestAFileHoldingADifferentToken:
 
         assert first_read(tmp_path).token == INSTALLED
 
-    def test_every_other_line_is_kept_exactly(self, tmp_path):
+    def test_every_other_line_is_kept_exactly(self, tmp_path, monkeypatch):
         # CRLF, comments, blanks, an export and an unquoted URL: none of it is
         # ours to tidy, and a lost API URL sends uploads to production.
+        monkeypatch.setenv(config.API_URL_ENV, "https://staging.example.test")
         write_env(tmp_path,
                   "# bench boat\r\n"
                   f"{config.API_URL_ENV}=https://staging.example.test\r\n"
@@ -150,7 +151,7 @@ class TestAFileHoldingADifferentToken:
 
         saved = [r for r in caplog.records if "saved the API token" in r.message]
         assert len(saved) == 1
-        assert saved[0].levelname == "INFO"
+        assert saved[0].levelname == "WARNING"
         assert config.fingerprint_of(INSTALLED) in saved[0].message
         assert f"replacing {config.fingerprint_of(EARLIER)}" in saved[0].message
 
@@ -161,14 +162,38 @@ class TestAFileHoldingADifferentToken:
         # a retired credential sitting in the file.
         write_env(tmp_path,
                   f"{config.TOKEN_ENV}={EARLIEST}\n"
-                  f"{config.API_URL_ENV}=https://example.test\n"
+                  f"{config.BATCH_MAX_ENV}=25\n"
                   f"{config.TOKEN_ENV}={EARLIER}\n")
 
         save_install_token(tmp_path)
 
         assert read_env(tmp_path) == (
             f"{config.TOKEN_ENV}={INSTALLED}\n"
-            f"{config.API_URL_ENV}=https://example.test\n")
+            f"{config.BATCH_MAX_ENV}=25\n")
+
+    def test_an_earlier_line_goes_even_when_the_last_one_already_matches(
+        self, tmp_path
+    ):
+        # The last line is the one that counts, so the file already reads as
+        # the install token, but the earlier one is still a retired credential.
+        write_env(tmp_path,
+                  f"{config.TOKEN_ENV}={EARLIER}\n"
+                  f"{config.TOKEN_ENV}={INSTALLED}\n")
+
+        save_install_token(tmp_path)
+
+        assert read_env(tmp_path) == f"{config.TOKEN_ENV}={INSTALLED}\n"
+
+    def test_a_byte_order_mark_does_not_hide_the_token_line(self, tmp_path):
+        # Some editors start a file with one, and it would otherwise hide the
+        # first line's name, so the old token would stay beside the new one.
+        env_file(tmp_path).write_bytes(
+            b"\xef\xbb\xbf" + f"{config.TOKEN_ENV}={EARLIER}\n".encode())
+
+        save_install_token(tmp_path)
+
+        assert read_env(tmp_path) == f"{config.TOKEN_ENV}={INSTALLED}\n"
+        assert first_read(tmp_path).token == INSTALLED
 
     def test_a_blank_token_line_is_filled_in_where_it_stands(self, tmp_path):
         write_env(tmp_path, f"{config.TOKEN_ENV}=\n{config.BATCH_MAX_ENV}=25\n")
@@ -179,10 +204,11 @@ class TestAFileHoldingADifferentToken:
             f"{config.TOKEN_ENV}={INSTALLED}\n{config.BATCH_MAX_ENV}=25\n")
 
     def test_a_file_with_no_token_line_gets_one_on_a_line_of_its_own(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         # No newline at the end of the last line, which is how printf without
         # \n leaves one, and appending straight onto it would corrupt the URL.
+        monkeypatch.setenv(config.API_URL_ENV, "https://example.test")
         write_env(tmp_path, f"{config.API_URL_ENV}=https://example.test")
 
         save_install_token(tmp_path)
@@ -224,6 +250,19 @@ class TestNothingToSave:
         save_install_token(tmp_path)
 
         assert read_env(tmp_path) == f"{config.TOKEN_ENV}={EARLIER}\n"
+
+    def test_a_copy_left_by_a_killed_save_is_removed(self, tmp_path):
+        # It holds a token, and nothing else would ever delete it. A file that
+        # only shares the name's start is someone else's.
+        abandoned = tmp_path / f"{config.ENV_FILENAME}.k1ll3d00.tmp"
+        abandoned.write_text(f"{config.TOKEN_ENV}={EARLIER}\n")
+        example = tmp_path / f"{config.ENV_FILENAME}.example"
+        example.write_text(f"{config.TOKEN_ENV}=\n")
+
+        save_install_token(tmp_path)
+
+        assert not abandoned.exists()
+        assert example.exists()
 
     @pytest.mark.parametrize(
         "value",
@@ -283,6 +322,34 @@ class TestAFileThatIsNotOursToRewrite:
         assert env_file(tmp_path).read_bytes() == original
         assert "could not be read" in caplog.text
 
+    def test_a_file_naming_another_api_keeps_its_own_token(self, tmp_path, caplog):
+        # A bench boat's file pairs its API with its token. The install token
+        # saved there would be sent to an API it was never issued for.
+        original = (f"{config.API_URL_ENV}=https://staging.example.test\n"
+                    f"{config.TOKEN_ENV}={EARLIER}\n")
+        write_env(tmp_path, original)
+
+        with caplog.at_level("WARNING"):
+            save_install_token(tmp_path)
+
+        assert read_env(tmp_path) == original
+        assert "names another API" in caplog.text
+
+    @pytest.mark.skipif(os.name != "posix", reason="symbolic links need privilege "
+                                                   "on Windows")
+    def test_a_symbolic_link_in_its_place_is_left_alone(self, tmp_path, caplog):
+        # Replacing the link would leave its target holding the old token.
+        target = tmp_path / "elsewhere"
+        target.write_text(f"{config.TOKEN_ENV}={EARLIER}\n")
+        env_file(tmp_path).symlink_to(target)
+
+        with caplog.at_level("WARNING"):
+            save_install_token(tmp_path)
+
+        assert env_file(tmp_path).is_symlink()
+        assert target.read_text() == f"{config.TOKEN_ENV}={EARLIER}\n"
+        assert "symbolic link" in caplog.text
+
     def test_the_boat_still_reads_the_token_from_the_environment(self, tmp_path):
         env_file(tmp_path).mkdir()
 
@@ -327,6 +394,23 @@ class TestAWriteThatFails:
         assert read_env(tmp_path) == f"{config.TOKEN_ENV}={EARLIER}\n"
         assert [path.name for path in tmp_path.iterdir()] == [config.ENV_FILENAME]
         assert "Permission denied" in caplog.text
+
+    def test_a_folder_flush_failing_after_the_rename_is_still_a_save(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # The file already holds the new token by then. Calling it a failed save
+        # would have a technician keep the token in Env for good.
+        write_env(tmp_path, f"{config.TOKEN_ENV}={EARLIER}\n")
+        monkeypatch.setattr(install_token, "_fsync_directory",
+                            refuse(OSError(errno.EINVAL, "Invalid argument")))
+
+        with caplog.at_level("INFO"):
+            save_install_token(tmp_path)
+
+        assert read_env(tmp_path) == f"{config.TOKEN_ENV}={INSTALLED}\n"
+        assert "saved the API token" in caplog.text
+        assert "could not save" not in caplog.text
+        assert "could not flush" in caplog.text
 
     def test_an_unexpected_failure_does_not_stop_the_start(
         self, tmp_path, monkeypatch, caplog

@@ -14,9 +14,10 @@ is handed a `Binding` and never a token, and there is no spelling of
 
 A missing token is a normal state, not an error. Nothing POSTs, nothing spins,
 capture and spool and archive carry on, and the reader keeps answering `TIME?`.
-Dropping a token in starts uploads within a minute with no restart, and a
-401 self-heals the same way, because a container restart is the one event that
-can lose an in-flight `TIME?`.
+The file is re-read once a minute, so a token that turns up in it is used with no
+restart, because a container restart is the one event that can lose an
+in-flight `TIME?`. A token still changes only through the installer, never by
+editing the file; install_token says why.
 """
 
 import hashlib
@@ -246,11 +247,10 @@ class ConfigWatcher:
     def _resolve_token(self, from_file: "dict[str, str] | None") -> str | None:
         """File first, environment second.
 
-        File first because it is the only ordering that permits rotation without
-        recreating the container, and a container restart is the one event that
-        can lose an in-flight TIME?. Environment second because boats already in
-        service hold their token in Kraken's Env field, so reading it means
-        MANTA Link replaces the bridge on those hulls with no re-provisioning.
+        File first because install_token saves the install token there at start
+        and the installer then takes it out of Kraken's Env, so the file is
+        where a boat's token lives. Environment second for a boat whose save
+        could not happen, which keeps running on the token in its Env field.
         """
         for source in (from_file or {}, os.environ):
             token = source.get(TOKEN_ENV, "").strip()
@@ -344,7 +344,9 @@ def read_env_text(path: Path) -> str | None:
     """The file's text exactly as stored, or None when there is no file.
 
     Exactly as stored, line endings included, because install_token rewrites one
-    line of this text and has to put every other line back unchanged.
+    line of this text and has to put every other line back unchanged. A leading
+    byte-order mark is the one thing dropped: some editors add one, and it would
+    hide the first line's name from parse_env.
     """
     try:
         info = path.stat()
@@ -364,7 +366,7 @@ def read_env_text(path: Path) -> str | None:
         raise UnusableEnvFile(f"is larger than {MAX_ENV_BYTES} bytes")
 
     try:
-        return path.read_bytes().decode("utf-8")
+        return path.read_bytes().decode("utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         raise UnusableEnvFile(f"could not be read ({exc})") from exc
 
