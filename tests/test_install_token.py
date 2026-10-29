@@ -9,6 +9,7 @@ log line, or a boat that stops reporting because its volume was read-only.
 import errno
 import os
 import stat
+import threading
 
 import pytest
 
@@ -109,6 +110,18 @@ class TestAFileHoldingTheSameToken:
         assert read_env(tmp_path) == original
         assert env_file(tmp_path).stat().st_mtime_ns == before
         assert "saved the API token" not in caplog.text
+
+    def test_it_says_the_file_already_holds_it(self, tmp_path, caplog):
+        # The positive sign a technician waits for before taking the token out
+        # of Env, on a start where there was nothing to save.
+        write_env(tmp_path, f"{config.TOKEN_ENV}={INSTALLED}\n")
+
+        with caplog.at_level("INFO"):
+            save_install_token(tmp_path)
+
+        assert (f"{env_file(tmp_path)} already holds the API token from the "
+                f"environment, fingerprint {config.fingerprint_of(INSTALLED)}"
+                in caplog.text)
 
 
 @pytest.mark.usefixtures("installed_with_a_token")
@@ -258,11 +271,28 @@ class TestNothingToSave:
         abandoned.write_text(f"{config.TOKEN_ENV}={EARLIER}\n")
         example = tmp_path / f"{config.ENV_FILENAME}.example"
         example.write_text(f"{config.TOKEN_ENV}=\n")
+        backup = tmp_path / f"{config.ENV_FILENAME}.backup.tmp"
+        backup.write_text(f"{config.TOKEN_ENV}={EARLIEST}\n")
 
         save_install_token(tmp_path)
 
         assert not abandoned.exists()
         assert example.exists()
+        assert backup.exists()
+
+    def test_one_copy_that_cannot_be_removed_does_not_keep_the_rest(
+        self, tmp_path, caplog
+    ):
+        stuck = tmp_path / f"{config.ENV_FILENAME}.aaaaaaaa.tmp"
+        stuck.mkdir()
+        abandoned = tmp_path / f"{config.ENV_FILENAME}.zzzzzzzz.tmp"
+        abandoned.write_text(f"{config.TOKEN_ENV}={EARLIER}\n")
+
+        with caplog.at_level("WARNING"):
+            save_install_token(tmp_path)
+
+        assert not abandoned.exists()
+        assert f"could not remove {stuck}" in caplog.text
 
     @pytest.mark.parametrize(
         "value",
@@ -333,7 +363,39 @@ class TestAFileThatIsNotOursToRewrite:
             save_install_token(tmp_path)
 
         assert read_env(tmp_path) == original
-        assert "names another API" in caplog.text
+        assert "does not send uploads to the API the install settings name" in (
+            caplog.text)
+
+    def test_an_install_naming_another_api_keeps_its_token_in_env(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # A file naming no API sends to production. Saved there, a staging
+        # token would go to production once a reinstall changed Env's URL.
+        monkeypatch.setenv(config.API_URL_ENV, "https://staging.example.test")
+        original = f"{config.BATCH_MAX_ENV}=25\n"
+        write_env(tmp_path, original)
+
+        with caplog.at_level("WARNING"):
+            save_install_token(tmp_path)
+
+        assert read_env(tmp_path) == original
+        assert "does not send uploads to the API the install settings name" in (
+            caplog.text)
+        assert first_read(tmp_path).source == config.SOURCE_ENVIRONMENT
+
+    def test_a_file_the_token_would_take_past_the_size_limit_is_left_alone(
+        self, tmp_path, caplog
+    ):
+        # The watcher refuses a file over the limit whole, so saving would lose
+        # every other setting in it.
+        original = "#" * (config.MAX_ENV_BYTES - 10) + "\n"
+        write_env(tmp_path, original)
+
+        with caplog.at_level("WARNING"):
+            save_install_token(tmp_path)
+
+        assert read_env(tmp_path) == original
+        assert f"would be larger than {config.MAX_ENV_BYTES} bytes" in caplog.text
 
     @pytest.mark.skipif(os.name != "posix", reason="symbolic links need privilege "
                                                    "on Windows")
@@ -427,6 +489,26 @@ class TestAWriteThatFails:
         assert watcher.config.token == INSTALLED
         assert "RuntimeError" in caplog.text
 
+    def test_a_save_stuck_in_fsync_does_not_hold_up_the_start(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # A failing card can hold an fsync for minutes, and the Pico asks TIME?
+        # only in its first three.
+        monkeypatch.setenv(__main__.VOLUME_ENV, str(tmp_path))
+        monkeypatch.setattr(__main__, "INSTALL_TOKEN_SAVE_TIMEOUT_S", 0.05)
+        release = threading.Event()
+        monkeypatch.setattr(install_token, "save_install_token",
+                            lambda volume: release.wait(5))
+
+        try:
+            with caplog.at_level("WARNING"):
+                watcher = __main__.load_config(TokenSession())
+        finally:
+            release.set()
+
+        assert watcher.config.token == INSTALLED
+        assert "starting without waiting for it" in caplog.text
+
 
 def a_fresh_volume(tmp_path, monkeypatch):
     pass
@@ -434,6 +516,10 @@ def a_fresh_volume(tmp_path, monkeypatch):
 
 def a_file_holding_another_token(tmp_path, monkeypatch):
     write_env(tmp_path, f"{config.TOKEN_ENV}={EARLIER}\n")
+
+
+def a_file_holding_the_same_token(tmp_path, monkeypatch):
+    write_env(tmp_path, f"{config.TOKEN_ENV}={INSTALLED}\n")
 
 
 def a_file_that_cannot_be_read(tmp_path, monkeypatch):
@@ -449,8 +535,8 @@ def a_write_that_fails(tmp_path, monkeypatch):
 @pytest.mark.usefixtures("installed_with_a_token")
 @pytest.mark.parametrize(
     "arrange",
-    [a_fresh_volume, a_file_holding_another_token, a_file_that_cannot_be_read,
-     a_write_that_fails],
+    [a_fresh_volume, a_file_holding_another_token, a_file_holding_the_same_token,
+     a_file_that_cannot_be_read, a_write_that_fails],
 )
 def test_no_log_line_carries_either_token(tmp_path, monkeypatch, caplog, arrange):
     arrange(tmp_path, monkeypatch)

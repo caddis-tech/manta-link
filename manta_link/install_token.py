@@ -23,6 +23,7 @@ from .config import (
     API_URL_ENV,
     DEFAULT_API_URL,
     ENV_FILENAME,
+    MAX_ENV_BYTES,
     TOKEN_ENV,
     UnusableEnvFile,
     fingerprint_of,
@@ -38,6 +39,10 @@ log = logging.getLogger(__name__)
 _CAN_FSYNC_DIRECTORY = hasattr(os, "O_DIRECTORY")
 
 _TEMP_SUFFIX = ".tmp"
+
+# mkstemp's own shape between prefix and suffix: eight of a-z, 0-9 and _. Only
+# names like that are ours to delete; a .env.backup.tmp is someone else's.
+_TEMP_RANDOM_PART = "[a-z0-9_]" * 8
 
 
 def save_install_token(data_dir: Path) -> None:
@@ -69,11 +74,14 @@ def save_install_token(data_dir: Path) -> None:
 
     assigned = _token_assignments(text)
     if assigned == [token]:
+        log.info("%s already holds the API token from the environment, "
+                 "fingerprint %s", path, fingerprint_of(token))
         return
 
-    if _names_another_api(text):
-        log.warning("%s names another API than the install settings; not saving "
-                    "the API token from the environment into it", path)
+    if _sends_to_another_api(text):
+        log.warning("%s does not send uploads to the API the install settings "
+                    "name; not saving the API token from the environment into it",
+                    path)
         return
 
     line = f"{TOKEN_ENV}={token}"
@@ -82,8 +90,14 @@ def save_install_token(data_dir: Path) -> None:
                     "not saving it into %s", TOKEN_ENV, path)
         return
 
+    rewritten = _with_token_line(text, line)
+    if len(rewritten.encode("utf-8")) > MAX_ENV_BYTES:
+        log.warning("%s would be larger than %d bytes with the API token in it; "
+                    "not saving it", path, MAX_ENV_BYTES)
+        return
+
     try:
-        _replace_file(path, _with_token_line(text, line))
+        _replace_file(path, rewritten)
     except OSError as exc:
         log.warning("could not save the API token from the environment into %s "
                     "(%s)", path, exc)
@@ -96,11 +110,18 @@ def _remove_abandoned_copies(path: Path) -> None:
 
     Each holds a token, and would otherwise outlive that token's retirement.
     """
+    pattern = f"{path.name}.{_TEMP_RANDOM_PART}{_TEMP_SUFFIX}"
     try:
-        for leftover in path.parent.glob(f"{path.name}.*{_TEMP_SUFFIX}"):
-            leftover.unlink(missing_ok=True)
+        leftovers = list(path.parent.glob(pattern))
     except OSError as exc:
-        log.warning("could not remove a temporary copy of %s (%s)", path, exc)
+        log.warning("could not look for temporary copies of %s (%s)", path, exc)
+        return
+    for leftover in leftovers:
+        try:
+            leftover.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not remove %s, a temporary copy of %s (%s)",
+                        leftover, path, exc)
 
 
 def _token_assignments(text: str) -> list[str]:
@@ -110,15 +131,16 @@ def _token_assignments(text: str) -> list[str]:
             if name == TOKEN_ENV]
 
 
-def _names_another_api(text: str) -> bool:
-    """Whether the file sends uploads to an API the install settings do not.
+def _sends_to_another_api(text: str) -> bool:
+    """Whether the file, read on its own, sends uploads to an API the install
+    settings do not.
 
-    A bench boat's file pairs its own API with its own token, and the install
-    token saved there would go to an API it was never issued for.
+    On its own because the settings can change at the next reinstall and the
+    file stays: a file naming no API sends to production. A bench boat's file
+    pairs its own API with its own token, and either way the install token saved
+    there would go to an API it was never issued for.
     """
-    named = parse_env(text).get(API_URL_ENV, "").strip()
-    if not named:
-        return False
+    named = parse_env(text).get(API_URL_ENV, "").strip() or DEFAULT_API_URL
     installed = os.environ.get(API_URL_ENV, "").strip() or DEFAULT_API_URL
     return named.rstrip("/") != installed.rstrip("/")
 
@@ -136,7 +158,8 @@ def _with_token_line(text: str, line: str) -> str:
     """`text` with `line` as its only token assignment, all else as it was.
 
     The new line takes the first assignment's place. Any later ones go, so no
-    retired token is left sitting in the file.
+    retired token is left assigned in the file. A commented-out one is a
+    comment, and stays as written.
     """
     kept: list[str] = []
     placed = False

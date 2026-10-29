@@ -17,6 +17,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import FrameType
@@ -53,6 +54,11 @@ DATA_DEVICE_ENV = "AQUADRONE_DATA_DEVICE"
 # Where the autopilot's position comes from. The default is the loopback address
 # MAVLink2Rest answers on under host networking; a bench run points it at a rig.
 MAVLINK2REST_URL_ENV = "AQUADRONE_MAVLINK2REST_URL"
+
+# How long start-up waits for the token save before opening the port anyway. The
+# save fsyncs, a failing card can hold an fsync for minutes, and the Pico asks
+# TIME? only in its first 180 seconds, so the wait is a small slice of those.
+INSTALL_TOKEN_SAVE_TIMEOUT_S = 5.0
 
 # Every variable that configures this process, and what leaving it unset means.
 # --help is built from this and the test suite reads the same tuple, so a knob
@@ -151,17 +157,19 @@ def open_or_carry_on(name: str, opener: Callable[[], None]) -> None:
 def load_config(tokens: config.TokenSession) -> config.ConfigWatcher:
     """Save the install token into the .env, then read the config once.
 
-    In that order, so the first read already finds the token in the file.
+    In that order, so the first read already finds the token in the file. The
+    save runs on its own thread so a stuck write cannot hold up the port.
     """
     volume = data_volume()
-    try:
-        install_token.save_install_token(volume)
-    except Exception as exc:
-        # Broad for open_or_carry_on's reason: every expected failure is already
-        # a warning in there, and nothing else may cost the port its owner. The
-        # type only, as upload.py logs it, since the token is in play here.
-        log.error("saving the API token into %s failed (%s); carrying on",
-                  volume, type(exc).__name__)
+    saver = threading.Thread(target=save_install_token_or_carry_on, args=(volume,),
+                             name="install-token", daemon=True)
+    saver.start()
+    saver.join(INSTALL_TOKEN_SAVE_TIMEOUT_S)
+    if saver.is_alive():
+        # A save that lands later is picked up by the next reload, as any change
+        # to the file is.
+        log.warning("saving the API token into %s has taken over %g s; starting "
+                    "without waiting for it", volume, INSTALL_TOKEN_SAVE_TIMEOUT_S)
 
     watcher = config.ConfigWatcher(volume, tokens)
     # Read once here rather than waiting for the first beat. Health credits
@@ -171,6 +179,17 @@ def load_config(tokens: config.TokenSession) -> config.ConfigWatcher:
     # reload runs on it once the port is open.
     watcher.reload()
     return watcher
+
+
+def save_install_token_or_carry_on(volume: Path) -> None:
+    try:
+        install_token.save_install_token(volume)
+    except Exception as exc:
+        # Broad for open_or_carry_on's reason: every expected failure is already
+        # a warning in there, and nothing else may cost the port its owner. The
+        # type only, as upload.py logs it, since the token is in play here.
+        log.error("saving the API token into %s failed (%s); carrying on",
+                  volume, type(exc).__name__)
 
 
 def parse_args(argv: list[str] | None = None) -> None:

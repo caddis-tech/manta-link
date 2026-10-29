@@ -271,7 +271,11 @@ a warning. A token changes only through the installer, never by editing the
 file, so a different token in the file is a hand edit, and the install's token
 is saved over it. Only the token line changes; every other line of the file
 stays as it was. Nothing is saved when `Env` holds no token or the file already
-holds the same one.
+holds the same one, and in that second case the log says so:
+
+```
+/app/data/.env already holds the API token from the environment, fingerprint 8b4d0e77
+```
 
 **Then the token comes back out of `Env`.** Kraken's API hands the settings to
 anyone on the boat's network who asks, with no login, so a token left in `Env`
@@ -280,23 +284,26 @@ no secret from a shell on the Pi, and BlueOS's web interface offers a terminal:
 the move narrows who can read the token, it does not lock it away. DroneSetup's
 Install / Repair is to take it out once it is saved
 (caddis-tech/aquadrone-setup#3). Until it does, and after a manual install, wait
-until the log shows `API token loaded, fingerprint ... (source: file)`, which
-every start prints once the token is in the file, then edit the extension and
-remove the token from `Env`.
+until the log shows the `saved` line or the `already holds` line above, then
+edit the extension and remove the token from `Env`. `API token loaded ...
+(source: file)` on its own is not enough: a file the save was refused for still
+reports its own token that way.
 
 If the save cannot happen, because the volume is read-only, the `.env` is a
-link or not a file MANTA Link will read, or the file names a different API
-from the install settings (a bench boat's file pairs its own API with its own
-token), it logs a warning naming the file and the reason, and carries on as
+link or not a file MANTA Link will read, the token would take the file past
+64 KiB, or the file would send uploads to a different API from the install
+settings, it logs a warning naming the file and the reason, and carries on as
 before: the file's token if it has one, `Env`'s if not. Leave the token in
-`Env` until that is fixed.
+`Env` until that is fixed. A file that names no API sends to production, so a
+manual install naming another API keeps its token in `Env`; a bench boat's file
+pairs its own API with its own token.
 
 **Kraken has no partial update.** The settings you send become the extension's
 entire configuration, so an `Env` entry left out of a reinstall is one the
 container loses. Reinstalling is how a boat's permissions get repaired, so read
 the boat's current `Env` and carry it forward before sending a new one. A token
-the log shows loaded with `source: file` is the exception: it is in the file,
-and leaving it out of `Env` is the point.
+the log shows `saved` into the file, or `already holds`, is the exception: it is
+in the file, and leaving it out of `Env` is the point.
 
 **Never change the token by editing the `.env`.** A token changes only when
 Caddis chooses to change it, never on a schedule, and only through DroneSetup
@@ -391,7 +398,7 @@ A missing line names the part that did not:
 |---|---|
 | `listening on /dev/ttyACM0` | `Privileged` and the `/dev` bind |
 | `polling MAVLink2Rest at http://127.0.0.1:6040` | `NetworkMode: host` |
-| `saved the API token from the environment into /app/data/.env` | the `Env` entry, on the start that installs it |
+| `API token loaded, fingerprint ...` | the `Env` entry, or the `.env` an earlier start saved it into |
 | `heartbeat: ... records_spooled=` climbing | the data volume bind is writable |
 
 After the save, `API token loaded` says `source: file`. `source: environment`
@@ -549,8 +556,9 @@ docker run --rm -it -v "$PWD/tools:/app/tools:ro" \
 
 `-e CADDIS_API_TOKEN` passes the device token through from your shell, so it is
 never typed into the command; a `.env` in a mounted `/app/data` works as on a
-boat, and as on a boat the token from your shell is saved into it. The save
-runs as the container's root user and leaves the file readable by its owner
+boat, and as on a boat the token from your shell is saved into it, though only
+when the file names the same API as `--api-url`, since one naming none sends to
+production. The save runs as the container's root user and leaves the file readable by its owner
 only, so on a Linux host your own `.env` then needs `sudo` to read or edit. For a
 caddis-api on the same machine, add `--network container:<its container>` and
 use `--api-url http://127.0.0.1:8000`: plain http is accepted
