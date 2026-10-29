@@ -215,8 +215,8 @@ BlueOS web UI, Extensions, **Installed** tab, the **+** button, then:
 Two halves. `HostConfig` is the Dockerfile's `permissions` label with the
 backslash continuations taken out, and the two have to be changed together:
 the Dockerfile's copy is what CI validates, and this one is what a boat
-actually runs on. `Env` is the boat-specific half, and it is where the token
-lives -- see below.
+actually runs on. `Env` is the boat-specific half, and it is how the token is
+delivered; see below.
 
 **A manual install does not read the image's `permissions` label.** Only a
 Bazaar install gets that, and it gets it from the Extensions Repository
@@ -250,8 +250,7 @@ nothing POSTs, nothing spins, and capture, spooling and `TIME?` all carry on.
 Uploads begin whenever a token turns up. Getting the extension running and
 provisioning it are two separate jobs and do not have to happen in one visit.
 
-The token goes in the `Env` array of the Custom settings above, which is how
-boats in service carry theirs:
+The token goes in the `Env` array of the Custom settings above:
 
 ```
 "CADDIS_API_TOKEN=<token>"
@@ -260,54 +259,87 @@ boats in service carry theirs:
 Installing without one means omitting that line, not setting it empty: an
 empty value is refused the same as a malformed one.
 
-**Kraken has no partial update.** The settings you send become the extension's
-entire configuration, so an `Env` entry left out of a reinstall is one the
-container loses. Reinstalling is how a boat's permissions get repaired, which
-makes it exactly the operation that silently drops a hand-provisioned token --
-read the boat's current `Env` and carry it forward before sending a new one.
+**At start, MANTA Link saves a token from `Env` into its own `.env`** on the
+persistent volume, and says so by fingerprint:
 
-A `.env` on the persistent volume works too, and **wins if both are set**:
-
-```bash
-ssh <boat> 'printf "CADDIS_API_TOKEN=%s\n" "<token>" > /app/data/.env'
+```
+saved the API token from the environment into /app/data/.env, fingerprint 8b4d0e77, replacing 3f9a1c2e
 ```
 
-`/app/data` is the default; `AQUADRONE_DATA_DIR` overrides it. The difference
-that matters is restart, not precedence: the file is re-read once a minute,
-so a token dropped in starts uploads **within a minute with no restart**, while editing Kraken's `Env` recreates the container -- the one
-event that can lose an in-flight `TIME?`. Use the file to rotate a token on a
-boat that is up; use `Env` to provision one, which is the only path that does
-not need SSH.
+`replacing` appears only when the file held a different token, and that line is
+a warning. A token changes only through the installer, never by editing the
+file, so a different token in the file is a hand edit, and the install's token
+is saved over it. Only the token line changes; every other line of the file
+stays as it was. Nothing is saved when `Env` holds no token or the file already
+holds the same one, and in that second case the log says so:
 
-**If you use the file, write it over SSH, not through Commander's `rig()`
-helper.** That helper is `curl -G --data-urlencode`, so the token would land
-in a query string, in shell history, and in Commander's request log. That is
-worth avoiding because it copies the token to places off the boat that nobody
-thinks to clean up, not because reading it on the boat is hard.
+```
+/app/data/.env already holds the API token from the environment, fingerprint 8b4d0e77
+```
 
-**Env versus the file is not a security decision.** Anyone who can reach the
-boat can read the token either way -- the BlueOS UI shows `Env`, and a shell
-reads the file. Choose on restart behaviour, above, and nothing else.
+**Then the token comes back out of `Env`.** Kraken's API hands the settings to
+anyone on the boat's network who asks, with no login, so a token left in `Env`
+is one request away from the whole network. No API serves the file, but it is
+no secret from a shell on the Pi, and BlueOS's web interface offers a terminal:
+the move narrows who can read the token, it does not lock it away. DroneSetup's
+Install / Repair is to take it out once it is saved
+(caddis-tech/aquadrone-setup#3). Until it does, and after a manual install, wait
+until the log shows the `saved` line or the `already holds` line above, then
+edit the extension and remove the token from `Env`. `API token loaded ...
+(source: file)` on its own is not enough: a file the save was refused for still
+reports its own token that way.
+
+If the save cannot happen, because the volume is read-only, the `.env` is a
+link or not a file MANTA Link will read, the token would take the file past
+64 KiB, or the file would send uploads to a different API from the install
+settings, it logs a warning naming the file and the reason, and carries on as
+before: the file's token if it has one, `Env`'s if not. Leave the token in
+`Env` until that is fixed. A file that names no API sends to production, so a
+manual install naming another API keeps its token in `Env`; a bench boat's file
+pairs its own API with its own token.
+
+**Kraken has no partial update.** The settings you send become the extension's
+entire configuration, so an `Env` entry left out of a reinstall is one the
+container loses. Reinstalling is how a boat's permissions get repaired, so read
+the boat's current `Env` and carry it forward before sending a new one. A token
+the log shows `saved` into the file, or `already holds`, is the exception: it is
+in the file, and leaving it out of `Env` is the point.
+
+**Never change the token by editing the `.env`.** A token changes only when
+Caddis chooses to change it, never on a schedule, and only through DroneSetup
+(below), so what the boat holds is always what the tool delivered. While `Env`
+still holds a token, a hand edit is overwritten at the next start, a reboot
+included, and that is intended. Once the token is out of `Env`, nothing is left
+to overwrite a hand edit from, so the rule rests on not making one.
+
+**A saved token stays through every reinstall,** one without a token included,
+because the volume outlives the container. A Pi moved to another boat keeps
+uploading as its old boat until DroneSetup installs the new boat's token, so
+install it as part of the move.
+
+The file lives in `/app/data` by default; `AQUADRONE_DATA_DIR` overrides it.
+Between starts the file wins over `Env`, and it is re-read once a minute.
 
 One other knob, optional: `CADDIS_BATCH_MAX` (default 50).
 
-#### Rotation
+#### Changing the token
 
-Overwrite the `.env` line. Within a minute it rebinds with no restart, and
-the log says so:
+Paste the new token into DroneSetup and run Install / Repair. The reinstall
+recreates the container, and that start saves the new token over the file's,
+with both fingerprints in the `saved` line; then it comes back out of `Env`, as
+for an install.
+
+Those are the first 8 characters of a SHA-256, not the token. **The token is
+never logged**, and neither is any transport error message, because a `requests`
+exception can carry the header it failed on. When the file's token changes
+between starts, MANTA Link rebinds within a minute with no restart and logs
+both fingerprints:
 
 ```
 API token changed from 3f9a1c2e to 8b4d0e77 (source: file)
 ```
 
-Those are the first 8 characters of a SHA-256, not the token. **The token is
-never logged**, and neither is any transport error message, because a `requests`
-exception can carry the header it failed on.
-
-Rotating through Kraken's `Env` instead recreates the container, so the new
-token is live at the next start rather than within a minute.
-
-Rotation replaces the whole session rather than re-heading a live one, so an
+A token change replaces the whole session rather than re-heading a live one, so an
 in-flight POST finishes on the credential it started with. There is no window
 where a retired token is still in use, which is the failure this design exists
 to prevent: it is silent, and the operator believes the old credential is dead.
@@ -366,11 +398,12 @@ A missing line names the part that did not:
 |---|---|
 | `listening on /dev/ttyACM0` | `Privileged` and the `/dev` bind |
 | `polling MAVLink2Rest at http://127.0.0.1:6040` | `NetworkMode: host` |
-| `API token loaded, fingerprint ... (source: environment)` | the `Env` entry |
+| `API token loaded, fingerprint ...` | the `Env` entry, or the `.env` an earlier start saved it into |
 | `heartbeat: ... records_spooled=` climbing | the data volume bind is writable |
 
-`source: environment` means the token came from Kraken's Env; `source: file`
-means a `.env` on the volume. Counters that are zero are omitted from the
+After the save, `API token loaded` says `source: file`. `source: environment`
+means the token is being read from Kraken's Env because it could not be saved,
+and the warning before it says why. Counters that are zero are omitted from the
 heartbeat entirely, so `spool_write_failures` is absent on a healthy boat rather
 than reported as 0 -- read `records_spooled` climbing as the positive signal.
 
@@ -523,8 +556,12 @@ docker run --rm -it -v "$PWD/tools:/app/tools:ro" \
 
 `-e CADDIS_API_TOKEN` passes the device token through from your shell, so it is
 never typed into the command; a `.env` in a mounted `/app/data` works as on a
-boat. For a caddis-api on the same machine, add `--network container:<its
-container>` and use `--api-url http://127.0.0.1:8000`: plain http is accepted
+boat, and as on a boat the token from your shell is saved into it, though only
+when the file names the same API as `--api-url`, since one naming none sends to
+production. The save runs as the container's root user and leaves the file readable by its owner
+only, so on a Linux host your own `.env` then needs `sudo` to read or edit. For a
+caddis-api on the same machine, add `--network container:<its container>` and
+use `--api-url http://127.0.0.1:8000`: plain http is accepted
 only on loopback.
 
 It refuses production. Its readings would be filed against a real pond as if a

@@ -124,8 +124,8 @@ class TestReloadReachesTheLiveSession:
 
 class TestWhereTheTokenComesFrom:
     def test_the_file_wins_over_the_environment(self, tmp_path, watcher, monkeypatch):
-        """File first is what permits rotation without recreating the container,
-        and a container restart is the one event that can lose a TIME?."""
+        """The file is where install_token saves a boat's token, so it is read
+        first; Env is only the fallback for a boat whose save failed."""
         monkeypatch.setenv(config.TOKEN_ENV, OTHER_TOKEN)
         write_env(tmp_path, f"{config.TOKEN_ENV}={TOKEN}")
 
