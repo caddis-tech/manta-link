@@ -80,8 +80,10 @@ class Config:
     token: str | None = field(default=None, repr=False)
     source: str | None = None
     batch_max: int = DEFAULT_BATCH_MAX
-    # Why uploads are off although someone configured them, in plain words. Set
-    # only with no token, so a refused setting can never post anywhere.
+    # Why uploads are off although a token is configured, in plain words. Set
+    # only with no token, so a refused setting can never post anywhere, and
+    # never production instead: someone said where uploads go. Readings keep
+    # spooling, so nothing is lost while it is fixed.
     refusal: str | None = None
 
     @property
@@ -216,6 +218,7 @@ class ConfigWatcher:
         previous = self._config
         current = self._resolve()
         self._config = current
+        self._say_uploads_off(previous, current)
         if previous == current:
             return False
 
@@ -223,9 +226,22 @@ class ConfigWatcher:
         self._announce(previous, current)
         return True
 
+    def _say_uploads_off(self, previous: "Config | None", current: Config) -> None:
+        """Why uploads are off, at ERROR: at once when the reason is new, then
+        once every few minutes until the setting changes.
+
+        At once, because the throttle alone could hold back the line for a
+        reason that appeared minutes after an earlier refusal was logged.
+        """
+        if current.refusal is None:
+            return
+        new = previous is None or previous.refusal != current.refusal
+        if self._uploads_off_log.should_emit() or new:
+            log.error("uploads are off: %s", current.refusal)
+
     def _announce(self, previous: "Config | None", current: Config) -> None:
         if current.refusal is not None:
-            # _refuse_uploads has already said why, at ERROR.
+            # _say_uploads_off has already said why, at ERROR.
             return
         if not current.configured:
             log.warning("no API token configured; uploads are off")
@@ -252,27 +268,18 @@ class ConfigWatcher:
         batch_max = self._resolve_batch_max(from_file)
         source = self._resolve_source(from_file)
         api_url = _api_url(from_file, source)
-        refusal = _url_refusal(api_url) or _pairing_refusal(
-            from_file, source, api_url, self._path)
-        if refusal is not None:
-            return self._refuse_uploads(refusal, batch_max)
+        # With no token there is nothing to protect, and "no API token
+        # configured" is the line that says what is missing.
+        refusal = source and (_url_refusal(api_url) or _pairing_refusal(
+            from_file, source, api_url, self._path))
+        if refusal:
+            return Config(batch_max=batch_max, refusal=refusal)
         return Config(
             api_url=api_url,
             token=self._resolve_token(from_file),
             source=source,
             batch_max=batch_max,
         )
-
-    def _refuse_uploads(self, refusal: str, batch_max: int) -> Config:
-        """A Config that uploads nothing, said at ERROR until the setting changes.
-
-        Never production instead: someone said where uploads go, and sending
-        the device token anywhere else is the one outcome worse than a pause.
-        Readings keep spooling, so nothing is lost while it is fixed.
-        """
-        if self._uploads_off_log.should_emit():
-            log.error("uploads are off: %s", refusal)
-        return Config(batch_max=batch_max, refusal=refusal)
 
     def _resolve_token(self, from_file: "Mapping[str, str]") -> str | None:
         """File first, environment second.

@@ -291,7 +291,8 @@ class TestTheApiUrl:
     def test_a_url_carrying_a_credential_is_refused_without_echoing_it(
         self, tmp_path, watcher, caplog
     ):
-        write_env(tmp_path, f"{config.API_URL_ENV}=https://user:hunter2@example.test")
+        write_env(tmp_path, f"{config.API_URL_ENV}=https://user:hunter2@example.test"
+                            f"\n{config.TOKEN_ENV}={TOKEN}")
 
         with caplog.at_level("WARNING"):
             watcher.reload()
@@ -332,7 +333,8 @@ class TestTheApiUrl:
     def test_the_refusal_is_said_again_while_it_lasts(
         self, tmp_path, watcher, monkeypatch, caplog
     ):
-        write_env(tmp_path, f"{config.API_URL_ENV}=http://10.0.0.5:8000")
+        write_env(tmp_path, f"{config.API_URL_ENV}=http://10.0.0.5:8000"
+                            f"\n{config.TOKEN_ENV}={TOKEN}")
         later = [1000.0, 1000.0 + config.REFUSAL_LOG_INTERVAL_S + 1]
         monkeypatch.setattr(logging_setup.time, "monotonic", lambda: later[0])
 
@@ -342,6 +344,40 @@ class TestTheApiUrl:
             watcher.reload()
 
         assert caplog.text.count("uploads are off") == 2
+
+    def test_a_new_refusal_is_said_at_once_inside_the_quiet_minutes(
+        self, tmp_path, watcher, monkeypatch, caplog
+    ):
+        # The throttle must not hold back the line for a reason that appears
+        # minutes after an earlier one was logged.
+        monkeypatch.setattr(logging_setup.time, "monotonic", lambda: 1000.0)
+        write_env(tmp_path, f"{config.API_URL_ENV}=http://10.0.0.5:8000"
+                            f"\n{config.TOKEN_ENV}={TOKEN}")
+        watcher.reload()
+        write_env(tmp_path, f"{config.API_URL_ENV}=https://example.test"
+                            f"\n{config.TOKEN_ENV}={TOKEN}")
+        watcher.reload()
+        write_env(tmp_path, f"{config.API_URL_ENV}=ftp://example.test"
+                            f"\n{config.TOKEN_ENV}={TOKEN}")
+
+        with caplog.at_level("ERROR"):
+            watcher.reload()
+
+        assert "uploads are off" in caplog.text
+        assert header(watcher) is None
+
+    def test_a_refused_url_with_no_token_says_there_is_no_token(
+        self, tmp_path, watcher, caplog
+    ):
+        # Nothing to protect, so the line that names what is missing is the
+        # one an unprovisioned boat shows.
+        write_env(tmp_path, f"{config.API_URL_ENV}=http://10.0.0.5:8000")
+
+        with caplog.at_level("WARNING"):
+            watcher.reload()
+
+        assert "no API token configured" in caplog.text
+        assert "uploads are off:" not in caplog.text
 
 
 class TestAFileTokenDoesNotBorrowEnvsApi:

@@ -536,6 +536,8 @@ def _what_would_stop_uploads(api_url: str) -> "str | None":
     watcher = config.ConfigWatcher(entry.data_volume(), config.TokenSession())
     watcher.reload()
     resolved = watcher.config
+    if resolved.refusal:
+        return resolved.refusal
     if _origin(resolved.api_url) != _origin(api_url):
         return (f"{watcher.path} names another API, which wins over --api-url; "
                 "remove it or point it at the same one")

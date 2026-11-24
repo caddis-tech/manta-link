@@ -362,7 +362,8 @@ def test_production_or_no_api_at_all_stops_it_before_the_port_is_touched(
 @pytest.mark.parametrize("env_file, token, says", [
     (f"{config.TOKEN_ENV}=t\n{config.API_URL_ENV}=https://example.org\n", None,
      "names another API"),
-    (f"{config.API_URL_ENV}=http://10.0.0.5:8000\n", "t", "names another API"),
+    (f"{config.API_URL_ENV}=http://10.0.0.5:8000\n", "t",
+     "names an API but holds no token"),
     ("", None, "nothing would upload"),
 ])
 def test_it_will_not_start_when_manta_link_would_not_upload_where_it_says(
