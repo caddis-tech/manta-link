@@ -31,6 +31,7 @@ from .config import (
     parse_env,
     parse_env_line,
     read_env_text,
+    same_api,
 )
 
 log = logging.getLogger(__name__)
@@ -148,9 +149,9 @@ def _names_the_same_api(addresses: list[str], url: str) -> bool:
     installer takes the settings back out, a file naming no API sends to
     production, with a token another API issued.
     """
-    wanted = [url] if url else []
-    return [found.rstrip("/") for found in addresses] == [
-        want.rstrip("/") for want in wanted]
+    if not url:
+        return not addresses
+    return len(addresses) == 1 and same_api(addresses[0], url)
 
 
 def _reads_back_intact(name: str, value: str) -> bool:
@@ -247,7 +248,7 @@ def _announce_move(addresses: list[str], url: str) -> None:
     if not named:
         return
     moved_to = url or DEFAULT_API_URL
-    if named.rstrip("/") == moved_to.rstrip("/"):
+    if same_api(named, moved_to):
         return
     log.warning("moved this boat's uploads to the API at %s, from %s, as its "
                 "install settings say", _server(moved_to), _server(named))

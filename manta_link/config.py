@@ -246,19 +246,20 @@ class ConfigWatcher:
                     previous.fingerprint, current.fingerprint, current.source)
 
     def _resolve(self) -> Config:
-        from_file = self._read_file()
+        # None and {} mean the same from here on; the difference matters only
+        # inside _read_file.
+        from_file = self._read_file() or {}
         batch_max = self._resolve_batch_max(from_file)
-        named_url = _named_url(from_file or {}) or _named_url(os.environ)
-        refusal = _url_refusal(named_url) if named_url else None
-        api_url = named_url or DEFAULT_API_URL
-        if refusal is None:
-            refusal = _pairing_refusal(from_file or {}, api_url, self._path)
+        source = self._resolve_source(from_file)
+        api_url = _api_url(from_file, source)
+        refusal = _url_refusal(api_url) or _pairing_refusal(
+            from_file, source, api_url, self._path)
         if refusal is not None:
             return self._refuse_uploads(refusal, batch_max)
         return Config(
             api_url=api_url,
             token=self._resolve_token(from_file),
-            source=self._resolve_source(from_file),
+            source=source,
             batch_max=batch_max,
         )
 
@@ -273,7 +274,7 @@ class ConfigWatcher:
             log.error("uploads are off: %s", refusal)
         return Config(batch_max=batch_max, refusal=refusal)
 
-    def _resolve_token(self, from_file: "dict[str, str] | None") -> str | None:
+    def _resolve_token(self, from_file: "Mapping[str, str]") -> str | None:
         """File first, environment second.
 
         File first because install_token saves the install token there at start
@@ -281,7 +282,7 @@ class ConfigWatcher:
         where a boat's token lives. Environment second for a boat whose save
         could not happen, which keeps running on the token in its Env field.
         """
-        for source in (from_file or {}, os.environ):
+        for source in (from_file, os.environ):
             token = source.get(TOKEN_ENV, "").strip()
             if token:
                 return token
@@ -289,15 +290,15 @@ class ConfigWatcher:
         # presence check and then 401s forever while the process reports healthy.
         return None
 
-    def _resolve_source(self, from_file: "dict[str, str] | None") -> str | None:
-        if (from_file or {}).get(TOKEN_ENV, "").strip():
+    def _resolve_source(self, from_file: "Mapping[str, str]") -> str | None:
+        if from_file.get(TOKEN_ENV, "").strip():
             return SOURCE_FILE
         if os.environ.get(TOKEN_ENV, "").strip():
             return SOURCE_ENVIRONMENT
         return None
 
-    def _resolve_batch_max(self, from_file: "dict[str, str] | None") -> int:
-        raw = (from_file or {}).get(BATCH_MAX_ENV) or os.environ.get(BATCH_MAX_ENV)
+    def _resolve_batch_max(self, from_file: "Mapping[str, str]") -> int:
+        raw = from_file.get(BATCH_MAX_ENV) or os.environ.get(BATCH_MAX_ENV)
         if not raw:
             return DEFAULT_BATCH_MAX
         try:
@@ -375,13 +376,38 @@ def read_env_text(path: Path) -> str | None:
         raise UnusableEnvFile(f"could not be read ({exc})") from exc
 
 
+def same_api(first: str, second: str) -> bool:
+    """Whether two API addresses name the same API, a trailing slash aside.
+
+    The one definition, because install_token saves a token with its address
+    and this module then checks the pair: the two must agree on what "same"
+    means, or a pair the saver calls matched has its uploads turned off.
+    """
+    return first.rstrip("/") == second.rstrip("/")
+
+
 def _named_url(source: "Mapping[str, str]") -> str | None:
     """The API address `source` names, or None when it leaves it to the next."""
     return source.get(API_URL_ENV, "").strip() or None
 
 
+def _api_url(from_file: "Mapping[str, str]", source: str | None) -> str:
+    """Where the token goes: the address its own source names, or production
+    when that source names none.
+
+    The token and its address are one pair, because a token belongs to the API
+    that issued it. Resolving them separately sent Env's token to an address
+    only the file named (caddis-tech/manta-link#39).
+    """
+    if source == SOURCE_FILE:
+        return _named_url(from_file) or DEFAULT_API_URL
+    if source == SOURCE_ENVIRONMENT:
+        return _named_url(os.environ) or DEFAULT_API_URL
+    return _named_url(from_file) or _named_url(os.environ) or DEFAULT_API_URL
+
+
 def _url_refusal(url: str) -> str | None:
-    """Why a named API address cannot carry a token, or None if it can.
+    """Why an API address cannot carry a token, or None if it can.
 
     The value is described but never echoed: an address refused for carrying a
     credential must not have that credential logged in the refusal.
@@ -400,25 +426,26 @@ def _url_refusal(url: str) -> str | None:
 
 
 def _pairing_refusal(
-    from_file: "Mapping[str, str]", api_url: str, path: Path
+    from_file: "Mapping[str, str]", source: str | None, api_url: str, path: Path
 ) -> str | None:
-    """Why the token would go to an API it was not issued for, or None.
+    """Why the other source names a different API from the token's, or None.
 
-    A token is issued by one API. Env's token belongs to Env's address, or to
-    production when Env names none, so it is never sent to an address only the
-    file names: a Pi that was a bench boat keeps its staging .env, and a
-    production token installed into Env would otherwise go to staging.
+    The file still wins when it holds both an address and a token. Otherwise a
+    second address is a conflict nothing here can settle, so neither is used.
     """
-    if from_file.get(TOKEN_ENV, "").strip():
-        return None
-    if not os.environ.get(TOKEN_ENV, "").strip():
-        return None
-    env_url = _named_url(os.environ) or DEFAULT_API_URL
-    if api_url.rstrip("/") == env_url.rstrip("/"):
-        return None
-    return (f"{path} names an API but holds no token, and the token in Env "
-            f"was issued for Env's API; put the token for that API in the "
-            f"file, or remove {API_URL_ENV} from it")
+    if source == SOURCE_ENVIRONMENT:
+        other = _named_url(from_file)
+        if other and not same_api(other, api_url):
+            return (f"{path} names an API but holds no token, and the token in "
+                    f"Env belongs to the API Env names; put that API's token "
+                    f"in the file, or remove {API_URL_ENV} from it")
+    if source == SOURCE_FILE and not _named_url(from_file):
+        other = _named_url(os.environ)
+        if other and not same_api(other, api_url):
+            return (f"the token in {path} comes with no {API_URL_ENV}, so it "
+                    f"belongs to production, but Env names another API; add "
+                    f"the token's API to the file")
+    return None
 
 
 def parse_env(text: str) -> dict[str, str]:

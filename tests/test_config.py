@@ -344,6 +344,46 @@ class TestTheApiUrl:
         assert caplog.text.count("uploads are off") == 2
 
 
+class TestAFileTokenDoesNotBorrowEnvsApi:
+    """The reverse of #39: a saved token with no address of its own is
+    production's, so it is never sent to an address only Env names."""
+
+    def test_a_file_token_with_no_url_is_not_sent_to_envs_api(
+        self, tmp_path, watcher, monkeypatch, caplog
+    ):
+        # A reinstall that sets a staging address and no token leaves the
+        # production token saved in the file.
+        monkeypatch.setenv(config.API_URL_ENV, "https://staging.example.test")
+        write_env(tmp_path, f"{config.TOKEN_ENV}={TOKEN}")
+
+        with caplog.at_level("ERROR"):
+            watcher.reload()
+
+        assert watcher.config.configured is False
+        assert header(watcher) is None
+        assert "Env names another API" in caplog.text
+
+    def test_env_naming_production_is_no_conflict(
+        self, tmp_path, watcher, monkeypatch
+    ):
+        monkeypatch.setenv(config.API_URL_ENV, config.DEFAULT_API_URL + "/")
+        write_env(tmp_path, f"{config.TOKEN_ENV}={TOKEN}")
+
+        watcher.reload()
+
+        assert header(watcher) == f"Token {TOKEN}"
+
+    def test_a_file_token_with_no_url_and_none_in_env_is_production(
+        self, tmp_path, watcher
+    ):
+        write_env(tmp_path, f"{config.TOKEN_ENV}={TOKEN}")
+
+        watcher.reload()
+
+        assert watcher.config.api_url == config.DEFAULT_API_URL
+        assert header(watcher) == f"Token {TOKEN}"
+
+
 class TestAnEnvTokenGoesOnlyToEnvsApi:
     """caddis-tech/manta-link#39: a token belongs to the API that issued it."""
 
