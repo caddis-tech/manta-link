@@ -231,6 +231,11 @@ State `CADDIS_API_URL` rather than leaving it to the default. The default is
 production, so an unset value is also how a bench boat silently uploads to
 production while reporting perfect health.
 
+A value MANTA Link refuses, plain http to anything but loopback or an address
+carrying a credential, turns uploads off rather than sending to production.
+Readings keep spooling, and `uploads are off: ...` is logged at ERROR every five
+minutes, saying why, until the setting is fixed.
+
 **Already installed?** The same block goes in **Edit** -- the pencil on the
 extension's card -- under Custom settings. Kraken recreates the container on
 save, so the boat is briefly without a `TIME?` responder while it does.
@@ -308,6 +313,13 @@ link or not a file MANTA Link will read, the token would take the file past
 it is, it logs a warning naming the file and the reason, and carries on as
 before: the file's token if it has one, `Env`'s if not. Leave the token in
 `Env` until that is fixed.
+
+A token read from `Env` goes only to `Env`'s address, or to production when
+`Env` names none, because a token belongs to the API that issued it. A `.env`
+that names some other address but holds no token of its own turns uploads off,
+with an ERROR naming the file, rather than sending `Env`'s token there. The reverse
+holds too: a token saved in the file with no address of its own is production's,
+so if `Env` names another API, uploads stop until the file names the token's API.
 
 **Kraken has no partial update.** The settings you send become the extension's
 entire configuration, so an `Env` entry left out of a reinstall is one the
@@ -578,5 +590,5 @@ only on loopback.
 It refuses production. Its readings would be filed against a real pond as if a
 drone had measured them, so it will not start against a `caddistech.com` host or
 any address Cloud Run gives the production service, and it confines uploads to the one API it was
-given: the production fallback this process uses for an unset or refused URL is
+given: the production default this process uses for an unset URL is
 replaced with one that cannot resolve.

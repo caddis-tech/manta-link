@@ -246,7 +246,10 @@ class TestQueueHandler:
         for thread in threads:
             thread.join()
 
-        assert wait_until(lambda: len(stream.lines) == 4)
+        # Only this test's own lines: workers test_health.py leaves running can
+        # flood the queue, and the drop report that follows is a fifth line.
+        assert wait_until(lambda: len(
+            [line for line in stream.lines if "manta_link.test from" in line]) == 4)
         assert writers == {"logsink"}
 
 

@@ -170,7 +170,8 @@ class Uploader:
         self._adopt(binding)
 
         if not binding.configured:
-            self._report_state("no API token configured; uploads are off")
+            self._report_state(self._watcher.config.refusal
+                               or "no API token configured; uploads are off")
             return Outcome.UNCONFIGURED
 
         limit = self._watcher.config.batch_max
