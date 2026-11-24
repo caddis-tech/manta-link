@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from manta_link import config
+from manta_link import config, logging_setup
 from manta_link.config import Config, ConfigWatcher, TokenSession
 
 TOKEN = "a" * 40
@@ -269,13 +269,24 @@ class TestTheApiUrl:
             "api.caddistech.com",
         ],
     )
-    def test_plaintext_to_anywhere_else_is_refused(self, tmp_path, watcher, url):
-        """A bench .env becomes a template, and the template gets copied."""
-        write_env(tmp_path, f"{config.API_URL_ENV}={url}")
+    def test_plaintext_to_anywhere_else_turns_uploads_off(
+        self, tmp_path, watcher, url, caplog
+    ):
+        """A bench .env becomes a template, and the template gets copied.
 
-        watcher.reload()
+        Refused means nothing is sent, not production instead: someone said
+        where uploads go, and the token must not go anywhere else
+        (caddis-tech/manta-link#31).
+        """
+        write_env(tmp_path, f"{config.API_URL_ENV}={url}\n{config.TOKEN_ENV}={TOKEN}")
 
-        assert watcher.config.api_url == config.DEFAULT_API_URL
+        with caplog.at_level("ERROR"):
+            watcher.reload()
+
+        assert watcher.config.configured is False
+        assert header(watcher) is None
+        assert "uploads are off" in caplog.text
+        assert "not https" in caplog.text
 
     def test_a_url_carrying_a_credential_is_refused_without_echoing_it(
         self, tmp_path, watcher, caplog
@@ -285,8 +296,120 @@ class TestTheApiUrl:
         with caplog.at_level("WARNING"):
             watcher.reload()
 
-        assert watcher.config.api_url == config.DEFAULT_API_URL
+        assert watcher.config.configured is False
+        assert "carries a credential" in caplog.text
         assert "hunter2" not in caplog.text
+
+    def test_a_refused_url_in_env_turns_uploads_off_too(self, watcher, monkeypatch):
+        monkeypatch.setenv(config.API_URL_ENV, "http://10.0.0.5:8000")
+        monkeypatch.setenv(config.TOKEN_ENV, TOKEN)
+
+        watcher.reload()
+
+        assert watcher.config.configured is False
+        assert header(watcher) is None
+
+    def test_an_unset_url_is_production(self, watcher, monkeypatch):
+        monkeypatch.setenv(config.TOKEN_ENV, TOKEN)
+
+        watcher.reload()
+
+        assert watcher.config.batch_endpoint.startswith(config.DEFAULT_API_URL)
+        assert header(watcher) == f"Token {TOKEN}"
+
+    def test_correcting_a_refused_url_resumes_uploads(self, tmp_path, watcher):
+        write_env(tmp_path, f"{config.API_URL_ENV}=http://10.0.0.5:8000\n"
+                            f"{config.TOKEN_ENV}={TOKEN}")
+        watcher.reload()
+
+        write_env(tmp_path, f"{config.API_URL_ENV}=https://example.test\n"
+                            f"{config.TOKEN_ENV}={TOKEN}")
+        watcher.reload()
+
+        assert watcher.config.api_url == "https://example.test"
+        assert header(watcher) == f"Token {TOKEN}"
+
+    def test_the_refusal_is_said_again_while_it_lasts(
+        self, tmp_path, watcher, monkeypatch, caplog
+    ):
+        write_env(tmp_path, f"{config.API_URL_ENV}=http://10.0.0.5:8000")
+        later = [1000.0, 1000.0 + config.REFUSAL_LOG_INTERVAL_S + 1]
+        monkeypatch.setattr(logging_setup.time, "monotonic", lambda: later[0])
+
+        with caplog.at_level("ERROR"):
+            watcher.reload()
+            later.pop(0)
+            watcher.reload()
+
+        assert caplog.text.count("uploads are off") == 2
+
+
+class TestAnEnvTokenGoesOnlyToEnvsApi:
+    """caddis-tech/manta-link#39: a token belongs to the API that issued it."""
+
+    def test_a_file_url_with_no_file_token_does_not_borrow_envs(
+        self, tmp_path, watcher, monkeypatch, caplog
+    ):
+        monkeypatch.setenv(config.TOKEN_ENV, TOKEN)
+        write_env(tmp_path, f"{config.API_URL_ENV}=https://staging.example.test")
+
+        with caplog.at_level("ERROR"):
+            watcher.reload()
+
+        assert watcher.config.configured is False
+        assert header(watcher) is None
+        assert str(tmp_path / config.ENV_FILENAME) in caplog.text
+        assert TOKEN not in caplog.text
+
+    def test_nor_when_env_names_another_api(self, tmp_path, watcher, monkeypatch):
+        monkeypatch.setenv(config.TOKEN_ENV, TOKEN)
+        monkeypatch.setenv(config.API_URL_ENV, "https://staging.example.test")
+        write_env(tmp_path, f"{config.API_URL_ENV}={config.DEFAULT_API_URL}")
+
+        watcher.reload()
+
+        assert watcher.config.configured is False
+
+    def test_a_file_naming_envs_own_api_may_use_envs_token(
+        self, tmp_path, watcher, monkeypatch
+    ):
+        monkeypatch.setenv(config.TOKEN_ENV, TOKEN)
+        monkeypatch.setenv(config.API_URL_ENV, "https://staging.example.test")
+        write_env(tmp_path, f"{config.API_URL_ENV}=https://staging.example.test/")
+
+        watcher.reload()
+
+        assert header(watcher) == f"Token {TOKEN}"
+
+    def test_a_file_naming_production_may_use_a_production_env_token(
+        self, tmp_path, watcher, monkeypatch
+    ):
+        monkeypatch.setenv(config.TOKEN_ENV, TOKEN)
+        write_env(tmp_path, f"{config.API_URL_ENV}={config.DEFAULT_API_URL}")
+
+        watcher.reload()
+
+        assert header(watcher) == f"Token {TOKEN}"
+
+    def test_a_file_with_both_is_unchanged(self, tmp_path, watcher, monkeypatch):
+        monkeypatch.setenv(config.TOKEN_ENV, OTHER_TOKEN)
+        write_env(tmp_path, f"{config.API_URL_ENV}=https://staging.example.test\n"
+                            f"{config.TOKEN_ENV}={TOKEN}")
+
+        watcher.reload()
+
+        assert watcher.config.api_url == "https://staging.example.test"
+        assert header(watcher) == f"Token {TOKEN}"
+
+    def test_a_file_with_neither_is_unchanged(self, tmp_path, watcher, monkeypatch):
+        monkeypatch.setenv(config.TOKEN_ENV, TOKEN)
+        monkeypatch.setenv(config.API_URL_ENV, "https://staging.example.test")
+        write_env(tmp_path, f"{config.BATCH_MAX_ENV}=10")
+
+        watcher.reload()
+
+        assert watcher.config.api_url == "https://staging.example.test"
+        assert header(watcher) == f"Token {TOKEN}"
 
     def test_the_batch_endpoint_is_built_from_it(self):
         built = Config(api_url="https://example.test/").batch_endpoint

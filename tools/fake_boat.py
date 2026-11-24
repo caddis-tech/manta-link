@@ -122,9 +122,8 @@ def confine_uploads(api_url: str) -> None:
     rebinds the clock: config.py is the one place an upload's address is
     decided, and the package should not grow a seam that exists only for this.
     `devices_url` rather than each endpoint, so the heartbeat is confined with
-    the upload and an endpoint added later is too. The fallback rebinding stops
-    being needed for refused URLs once the package stops failing open
-    (caddis-tech/manta-link#31).
+    the upload and an endpoint added later is too. A refused URL already
+    uploads nothing; the default is rebound because an unset URL is production.
     """
     allowed = _origin(api_url)
     shipped = config.Config.devices_url.fget

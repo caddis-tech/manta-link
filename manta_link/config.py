@@ -25,6 +25,7 @@ import logging
 import os
 import stat
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -79,6 +80,9 @@ class Config:
     token: str | None = field(default=None, repr=False)
     source: str | None = None
     batch_max: int = DEFAULT_BATCH_MAX
+    # Why uploads are off although someone configured them, in plain words. Set
+    # only with no token, so a refused setting can never post anywhere.
+    refusal: str | None = None
 
     @property
     def configured(self) -> bool:
@@ -184,6 +188,9 @@ class ConfigWatcher:
         # reintroduced by its own fix.
         self._lock = threading.Lock()
         self._refusal_log = Throttle(REFUSAL_LOG_INTERVAL_S)
+        # Its own, so a refused batch size cannot swallow the line saying
+        # uploads are off.
+        self._uploads_off_log = Throttle(REFUSAL_LOG_INTERVAL_S)
 
     @property
     def config(self) -> Config:
@@ -217,6 +224,9 @@ class ConfigWatcher:
         return True
 
     def _announce(self, previous: "Config | None", current: Config) -> None:
+        if current.refusal is not None:
+            # _refuse_uploads has already said why, at ERROR.
+            return
         if not current.configured:
             log.warning("no API token configured; uploads are off")
             return
@@ -237,12 +247,31 @@ class ConfigWatcher:
 
     def _resolve(self) -> Config:
         from_file = self._read_file()
+        batch_max = self._resolve_batch_max(from_file)
+        named_url = _named_url(from_file or {}) or _named_url(os.environ)
+        refusal = _url_refusal(named_url) if named_url else None
+        api_url = named_url or DEFAULT_API_URL
+        if refusal is None:
+            refusal = _pairing_refusal(from_file or {}, api_url, self._path)
+        if refusal is not None:
+            return self._refuse_uploads(refusal, batch_max)
         return Config(
-            api_url=self._resolve_url(from_file),
+            api_url=api_url,
             token=self._resolve_token(from_file),
             source=self._resolve_source(from_file),
-            batch_max=self._resolve_batch_max(from_file),
+            batch_max=batch_max,
         )
+
+    def _refuse_uploads(self, refusal: str, batch_max: int) -> Config:
+        """A Config that uploads nothing, said at ERROR until the setting changes.
+
+        Never production instead: someone said where uploads go, and sending
+        the device token anywhere else is the one outcome worse than a pause.
+        Readings keep spooling, so nothing is lost while it is fixed.
+        """
+        if self._uploads_off_log.should_emit():
+            log.error("uploads are off: %s", refusal)
+        return Config(batch_max=batch_max, refusal=refusal)
 
     def _resolve_token(self, from_file: "dict[str, str] | None") -> str | None:
         """File first, environment second.
@@ -266,31 +295,6 @@ class ConfigWatcher:
         if os.environ.get(TOKEN_ENV, "").strip():
             return SOURCE_ENVIRONMENT
         return None
-
-    def _resolve_url(self, from_file: "dict[str, str] | None") -> str:
-        raw = (from_file or {}).get(API_URL_ENV) or os.environ.get(API_URL_ENV)
-        if not raw:
-            return DEFAULT_API_URL
-
-        parsed = urlsplit(raw.strip())
-        if parsed.username or parsed.password:
-            return self._refuse_url(raw, "it carries a credential")
-        if parsed.scheme == "https":
-            return raw.strip()
-        if parsed.scheme == "http" and parsed.hostname in LOOPBACK_HOSTS:
-            # A bench caddis-api on the same desk, where there is no certificate
-            # to be had. Anything else in plain http puts a device credential on
-            # the wire in clear.
-            return raw.strip()
-        return self._refuse_url(raw, f"{parsed.scheme or 'no scheme'} is not https")
-
-    def _refuse_url(self, raw: str, why: str) -> str:
-        if self._refusal_log.should_emit():
-            # The value is named but never echoed: a URL refused for carrying a
-            # credential must not have that credential logged in the refusal.
-            log.warning("%s is unusable (%s); falling back to %s",
-                        API_URL_ENV, why, DEFAULT_API_URL)
-        return DEFAULT_API_URL
 
     def _resolve_batch_max(self, from_file: "dict[str, str] | None") -> int:
         raw = (from_file or {}).get(BATCH_MAX_ENV) or os.environ.get(BATCH_MAX_ENV)
@@ -369,6 +373,52 @@ def read_env_text(path: Path) -> str | None:
         return path.read_bytes().decode("utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         raise UnusableEnvFile(f"could not be read ({exc})") from exc
+
+
+def _named_url(source: "Mapping[str, str]") -> str | None:
+    """The API address `source` names, or None when it leaves it to the next."""
+    return source.get(API_URL_ENV, "").strip() or None
+
+
+def _url_refusal(url: str) -> str | None:
+    """Why a named API address cannot carry a token, or None if it can.
+
+    The value is described but never echoed: an address refused for carrying a
+    credential must not have that credential logged in the refusal.
+    """
+    parsed = urlsplit(url)
+    if parsed.username or parsed.password:
+        return f"{API_URL_ENV} carries a credential"
+    if parsed.scheme == "https":
+        return None
+    if parsed.scheme == "http" and parsed.hostname in LOOPBACK_HOSTS:
+        # A bench caddis-api on the same desk, where there is no certificate to
+        # be had. Anything else in plain http puts a device credential on the
+        # wire in clear.
+        return None
+    return f"{API_URL_ENV} is {parsed.scheme or 'missing a scheme'}, not https"
+
+
+def _pairing_refusal(
+    from_file: "Mapping[str, str]", api_url: str, path: Path
+) -> str | None:
+    """Why the token would go to an API it was not issued for, or None.
+
+    A token is issued by one API. Env's token belongs to Env's address, or to
+    production when Env names none, so it is never sent to an address only the
+    file names: a Pi that was a bench boat keeps its staging .env, and a
+    production token installed into Env would otherwise go to staging.
+    """
+    if from_file.get(TOKEN_ENV, "").strip():
+        return None
+    if not os.environ.get(TOKEN_ENV, "").strip():
+        return None
+    env_url = _named_url(os.environ) or DEFAULT_API_URL
+    if api_url.rstrip("/") == env_url.rstrip("/"):
+        return None
+    return (f"{path} names an API but holds no token, and the token in Env "
+            f"was issued for Env's API; put the token for that API in the "
+            f"file, or remove {API_URL_ENV} from it")
 
 
 def parse_env(text: str) -> dict[str, str]:
